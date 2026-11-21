@@ -1965,27 +1965,31 @@ impl Store {
         )?)
     }
 
-    /// The lead's reply of the newest row of `conversation` before row `before` that has
-    /// one, `None` when there is none or its turn read text from outside the owner's
-    /// messages (the message the owner's row answered).
+    /// The lead's reply to the newest main (not steered) row of `conversation` before row
+    /// `before` (the message the owner's row answered). `None` when that row has no reply
+    /// (a failed turn never yields an older reply), was not the owner's own message, or its
+    /// turn read text from outside the owner's messages.
     pub fn previous_reply(
         &self,
         conversation: &str,
         before: i64,
+        owner: &str,
     ) -> Result<Option<String>, StoreError> {
-        let row: Option<(String, i64)> = self
+        let row: Option<(Option<String>, i64, String, String)> = self
             .conn
             .query_row(
-                "SELECT reply, reads_outside FROM inbox
-                 WHERE conversation_key = ?1 AND id < ?2 AND reply IS NOT NULL
+                "SELECT reply, reads_outside, origin, author_id FROM inbox
+                 WHERE conversation_key = ?1 AND id < ?2 AND steered_into IS NULL
                  ORDER BY id DESC LIMIT 1",
                 params![conversation, before],
-                |r| Ok((r.get(0)?, r.get(1)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
             )
             .optional()?;
-        Ok(row
-            .filter(|(_, outside)| *outside == 0)
-            .map(|(reply, _)| reply))
+        Ok(row.and_then(|(reply, outside, origin, author)| {
+            (outside == 0 && origin == "owner" && author == owner)
+                .then_some(reply)
+                .flatten()
+        }))
     }
 
     /// The last finished owner row from `owner` received before the UTC date `day`

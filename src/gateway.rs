@@ -118,6 +118,8 @@ impl Gateway {
             redactor.clone(),
             memory::system_clock(),
         )?)?;
+        // Leftover curator log rows settle here, whatever the curate mode.
+        crate::curate::settle_pending(&store, memory.root());
         let advisor = (config.memory.recall_mode() != RecallMode::Off)
             .then(|| Arc::new(Advisor::new(config, Arc::clone(&store), redactor.clone())));
         let mut omp = OmpManager::new(config.clone(), Arc::clone(&store))
@@ -357,5 +359,32 @@ mod tests {
         drop(store);
         stop.send(()).expect("stop");
         run.await.expect("join").expect("clean stop");
+    }
+
+    #[tokio::test]
+    async fn leftover_curator_log_rows_settle_at_start_even_with_curation_off() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let mut config = config(dir.path());
+        config.memory.curate.mode = CurateMode::Off;
+        {
+            let mut store = Store::open(&config.home.join(STORE_FILE)).expect("store");
+            store
+                .log_curate_pending(&[crate::store::CurateLogRow {
+                    run_id: 1,
+                    at: 1,
+                    op: "save".into(),
+                    entry_id: "r7.s0".into(),
+                    other_id: None,
+                    bucket: format!("thread:{CHAN}"),
+                    detail: None,
+                    shadow: false,
+                }])
+                .expect("pending");
+        }
+        let gateway = Gateway::open(&config, Arc::new(FakeAdapter::new())).expect("open");
+        assert!(gateway.curator.is_none());
+        let store = lock(&gateway.store);
+        assert!(store.pending_curate_log().expect("pending").is_empty());
+        assert!(store.recent_curate_log(5).expect("log").is_empty());
     }
 }

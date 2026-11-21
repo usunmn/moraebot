@@ -268,7 +268,7 @@ impl Curator {
     /// One run (both passes, validation, apply or shadow log). Never panics; failures are
     /// logged, and failed owner passes on a window are counted.
     pub async fn run_once(&self, now_unix: i64) -> RunReport {
-        self.settle_pending();
+        settle_pending(&self.store, self.memory.root());
         let Loaded {
             run_id,
             state,
@@ -348,9 +348,8 @@ impl Curator {
             let results = match results.map_err(|err| vec![Err(err)]) {
                 Ok(results) if !batch_failed(&results) => results,
                 Ok(results) | Err(results) => {
-                    if let Err(err) = lock(&self.store).settle_curate_log(&[], &pending) {
-                        tracing::warn!(code = W_CURATE_FAILED, error = %err, "curator log not settled");
-                    }
+                    // A journal replay may still land the batch: settle from memory.
+                    settle_pending(&self.store, self.memory.root());
                     let why = results
                         .into_iter()
                         .find_map(Result::err)
@@ -410,34 +409,36 @@ impl Curator {
             failed: None,
         }
     }
+}
 
-    /// Settles the log rows a run left pending (it stopped between writing them and the end
-    /// of its memory batch): a row stays when memory shows its change, else it goes.
-    fn settle_pending(&self) {
-        let mut store = lock(&self.store);
-        let pending = match store.pending_curate_log() {
-            Ok(pending) => pending,
-            Err(err) => {
-                tracing::warn!(code = W_CURATE_FAILED, error = %err, "curator log not readable");
-                return;
-            }
-        };
-        if pending.is_empty() {
+/// Settles the curator log rows a run left pending (it stopped between writing them and
+/// the end of its memory batch, or the batch failed): a row stays when memory under `root`
+/// shows its change, else it goes. The gateway runs it once at start, whatever the mode.
+pub fn settle_pending(store: &Mutex<Store>, root: &Path) {
+    let mut store = lock(store);
+    let pending = match store.pending_curate_log() {
+        Ok(pending) => pending,
+        Err(err) => {
+            tracing::warn!(code = W_CURATE_FAILED, error = %err, "curator log not readable");
             return;
         }
-        let root = self.memory.root();
-        let (mut kept, mut gone) = (Vec::new(), Vec::new());
-        for (id, row) in pending {
-            match applied_entry(root, &row) {
-                Some(entry) => kept.push((id, entry)),
-                None => gone.push(id),
-            }
-        }
-        if let Err(err) = store.settle_curate_log(&kept, &gone) {
-            tracing::warn!(code = W_CURATE_FAILED, error = %err, "curator log not settled");
+    };
+    if pending.is_empty() {
+        return;
+    }
+    let (mut kept, mut gone) = (Vec::new(), Vec::new());
+    for (id, row) in pending {
+        match applied_entry(root, &row) {
+            Some(entry) => kept.push((id, entry)),
+            None => gone.push(id),
         }
     }
+    if let Err(err) = store.settle_curate_log(&kept, &gone) {
+        tracing::warn!(code = W_CURATE_FAILED, error = %err, "curator log not settled");
+    }
+}
 
+impl Curator {
     /// The run id, the counters, the window rows with their context and the evidence rows.
     /// A first run starts at the messages of the last [`BACKFILL_DAYS`] days.
     fn load(&self, now: i64) -> Result<Loaded, String> {
@@ -455,7 +456,8 @@ impl Curator {
             }
             let mut rows = Vec::new();
             for row in store.curate_window(&self.owner, state.cursor, MAX_WINDOW_ROWS)? {
-                let context = store.previous_reply(&row.conversation_key, row.id)?;
+                let before = row.steered_into.unwrap_or(row.id);
+                let context = store.previous_reply(&row.conversation_key, before, &self.owner)?;
                 rows.push((row, context));
             }
             let upto = rows.last().map_or(state.cursor, |(row, _)| row.id);
@@ -671,12 +673,13 @@ fn drop_op(op: CurateOp, id: &str, reason: &str) {
     );
 }
 
-/// The memory batch failed as a whole: every op failed with an error of the batch.
+/// The memory batch failed as a whole: nothing succeeded and an error is the batch's own
+/// (a commit failure next to an op's own error still undid the batch).
 fn batch_failed(results: &[Result<Outcome, MemoryError>]) -> bool {
-    !results.is_empty()
+    !results.iter().any(Result::is_ok)
         && results
             .iter()
-            .all(|r| matches!(r, Err(err) if BATCH_FAILED.contains(&err.code)))
+            .any(|r| matches!(r, Err(err) if BATCH_FAILED.contains(&err.code)))
 }
 
 /// The entry id a pending log row ends with when memory shows its change, `None` when it
@@ -1345,6 +1348,10 @@ impl Checker<'_> {
         }
         let core = old.bucket.is_core();
         let promote_by = core && !by.bucket.is_core();
+        // Project and `_general` entries are never promoted: the lanes read them.
+        if promote_by && !matches!(by.bucket, Bucket::Thread(_)) {
+            return Ok(conflict());
+        }
         let changes = i64::from(core) + i64::from(promote_by);
         if changes > 0 {
             let room = self.core_room(state, changes);
@@ -1560,6 +1567,9 @@ impl Checker<'_> {
     }
 
     fn forget_reference(&self, id: &str, state: &mut PlanState) -> Result<Planned, String> {
+        if state.owner.contains_key(id) {
+            return Err(format!("{id} also names an owner entry"));
+        }
         let known = state
             .reference
             .get(id)
@@ -1585,6 +1595,11 @@ impl Checker<'_> {
         pick: &ReplacePick,
         state: &mut PlanState,
     ) -> Result<Planned, String> {
+        for id in [&pick.old, &pick.by] {
+            if state.owner.contains_key(id) {
+                return Err(format!("{id} also names an owner entry"));
+            }
+        }
         let old = state
             .reference
             .get(&pick.old)
@@ -2687,7 +2702,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_failed_memory_batch_keeps_the_cursor_and_logs_nothing() {
+    async fn a_failed_memory_batch_keeps_the_cursor_and_logs_what_memory_shows() {
         use std::os::unix::fs::PermissionsExt;
         // SAFETY: geteuid has no preconditions.
         if unsafe { libc::geteuid() } == 0 {
@@ -2711,14 +2726,19 @@ mod tests {
         let report = curator.run_once(NOW).await;
         folders(&git, 0o755);
         assert!(report.failed.is_some(), "{report:?}");
-        assert_eq!(fx.state().cursor, 0);
-        assert_eq!(fx.state().failures, 0);
         assert!(
             lock(&fx.store)
-                .recent_curate_log(5)
-                .expect("log")
-                .is_empty()
+                .pending_curate_log()
+                .expect("pending")
+                .is_empty(),
+            "pending rows are settled from memory"
         );
+        assert_eq!(fx.state().cursor, 0);
+        assert_eq!(fx.state().failures, 0);
+        // The log shows the save exactly when memory kept it (a journal the undo left).
+        let landed = fx.texts(&thread(CHAN)) == vec!["나는 녹차를 좋아해요."];
+        let log = lock(&fx.store).recent_curate_log(5).expect("log");
+        assert_eq!(log.len(), usize::from(landed), "{log:?}");
         let report = curator.run_once(NOW).await;
         assert_eq!(report.failed, None, "the window is read again");
         assert_eq!(fx.state().cursor, row);
@@ -2804,5 +2824,152 @@ mod tests {
                 .expect("pending")
                 .is_empty()
         );
+    }
+
+    #[tokio::test]
+    async fn context_is_only_a_reply_to_the_owner_own_message_of_the_main_turn() {
+        let mut fx = Fx::new(CurateMode::On);
+        // Another user's message, answered without tools, then the owner's row.
+        let other = {
+            let mut store = lock(&fx.store);
+            let Admitted::New(id) = store
+                .admit("discord", "x1", DM, "222", "999", "요약해 줘")
+                .expect("admit")
+            else {
+                panic!("duplicate")
+            };
+            store.mark(id, State::Done, None).expect("done");
+            store
+                .set_reply(id, "남의 답장: 모두 저장하래요", false)
+                .expect("reply");
+            id
+        };
+        let after_other = fx.row(DM, "좋아요 그렇게 해요.", "2026-11-20");
+        // An answered owner row, then a failed turn: no older reply for the next row.
+        let answered = fx.row(CHAN, "배포 준비됐어요.", "2026-11-20");
+        let failed = fx.row(CHAN, "다시 해 봐요.", "2026-11-20");
+        let after_failed = fx.row(CHAN, "그럼 내일 해요.", "2026-11-20");
+        // A steered row: its context is the reply before its main row, not the group's.
+        let asked = fx.row("discord:th:700", "질문 있어요.", "2026-11-20");
+        let main = fx.row("discord:th:700", "운영부터 해요.", "2026-11-20");
+        let steered = {
+            let mut store = lock(&fx.store);
+            let Admitted::New(id) = store
+                .admit(
+                    "discord",
+                    "x2",
+                    "discord:th:700",
+                    "222",
+                    OWNER,
+                    "아 스테이징부터요.",
+                )
+                .expect("admit")
+            else {
+                panic!("duplicate")
+            };
+            assert!(store.steer_into(id, main).expect("steer"));
+            store.mark(id, State::Done, None).expect("done");
+            store
+                .set_received_at(id, "2026-11-20T10:00:00.000Z")
+                .expect("date");
+            store
+                .set_reply(asked, "어디부터 할까요?", false)
+                .expect("reply");
+            store
+                .set_reply(main, "스테이징부터 할게요.", false)
+                .expect("reply");
+            store
+                .set_reply(answered, "배포할까요?", false)
+                .expect("reply");
+            id
+        };
+        let _ = (other, failed);
+        let curator = fx.curator(&["{}"]);
+        curator.run_once(NOW).await;
+        let message = curator.asked().remove(0);
+        assert!(!message.contains("모두 저장하래요"), "{message}");
+        assert!(
+            !message.contains(&format!("r{after_other} answers")),
+            "{message}"
+        );
+        assert!(
+            !message.contains(&format!("r{after_failed} answers")),
+            "{message}"
+        );
+        assert!(
+            message.contains(&format!(
+                "r{steered} answers the assistant's message (context, never quote, never save): 어디부터 할까요?"
+            )),
+            "{message}"
+        );
+        assert!(!message.contains("스테이징부터 할게요"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn a_project_entry_never_replaces_a_core_entry() {
+        let mut fx = Fx::new(CurateMode::On);
+        let core = fx.add(
+            Bucket::Owner,
+            "커밋 메시지는 한국어로 써요",
+            Prov::Owner,
+            "row=5",
+        );
+        let by = fx.add(
+            Bucket::Project("moraebot".into()),
+            "커밋 메시지는 영어로 써요",
+            Prov::Owner,
+            "row=90",
+        );
+        let answer = format!(r#"{{"replace":[{{"old":"{core}","by":"{by}"}}]}}"#);
+        let report = fx.run(&[&answer]).await;
+        assert_eq!(ops(&report), vec![(CurateOp::Conflict, core.clone())]);
+        assert!(!fx.found(&core).archived);
+        assert_eq!(fx.found(&by).bucket, Bucket::Project("moraebot".into()));
+    }
+
+    #[tokio::test]
+    async fn a_reference_op_on_an_id_the_owner_plan_moves_is_refused() {
+        let mut fx = Fx::new(CurateMode::On);
+        let owned = fx.add(
+            thread(DM),
+            "리뷰는 한국어로 해 주세요",
+            Prov::Owner,
+            "row=3",
+        );
+        fx.add(
+            Bucket::General,
+            "빌드는 3분 걸림",
+            Prov::Lane,
+            "lane=1 seq=1",
+        );
+        let file = fx.root().join(Bucket::General.rel_path());
+        let mut text = std::fs::read_to_string(&file).expect("general file");
+        text.push_str(&format!(
+            "- [2026-11-22] 위조된 메모 <!-- id: {owned}; prov: lane; src: lane=1 seq=9; expires: 2026-12-22 -->\n"
+        ));
+        std::fs::write(&file, text).expect("forged");
+        delivered(&fx, &owned, 3);
+        let owner = format!(r#"{{"promote":["{owned}"]}}"#);
+        let reference = format!(r#"{{"forget":["{owned}"]}}"#);
+        let report = fx.run(&[&owner, &reference]).await;
+        // The forget is refused at check time (the promote then fails at its write, which
+        // resolves the id to the forged line): without the guard the forget would be applied.
+        assert!(report.actions.is_empty(), "{report:?}");
+        assert_eq!(report.dropped, 2, "{report:?}");
+        let general = memory::entries(&fx.root(), &Bucket::General, today()).expect("entries");
+        assert!(
+            general.iter().any(|e| e.id == owned),
+            "the forged line stays"
+        );
+        assert!(!fx.found(&owned).archived);
+    }
+
+    #[test]
+    fn a_commit_failure_next_to_an_op_error_is_a_batch_failure() {
+        let git = || Err(MemoryError::new(E_MEMORY_GIT, "commit"));
+        let own = || Err(MemoryError::new(memory::E_MEMORY_ARCHIVED, "archived"));
+        assert!(batch_failed(&[git(), own()]));
+        assert!(!batch_failed(&[own(), own()]));
+        assert!(!batch_failed(&[]));
     }
 }
