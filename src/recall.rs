@@ -59,7 +59,8 @@
 //!   rejections `rejected` rows of the recall ledger ([`crate::store::RecallRow`]), tagged
 //!   with the lead generation (persisted lead starts) and the lead child's compaction epoch.
 //!   A picked entry is not offered again in the same lead context; a rejected one not again
-//!   in that conversation for [`REJECT_DAYS`] days unless its text changed.
+//!   to wakes of the same phase (owner or mid) in that conversation for [`REJECT_DAYS`] days
+//!   unless its text changed.
 //! - **Caps.** `max_calls_per_hour`, `max_input_bytes`, `timeout_seconds`, omp's `max_cost_usd`,
 //!   [`MAX_CALLS_AT_ONCE`], and a breaker: after [`BREAKER_FAILURES`] failures in a row, one
 //!   probe per [`BREAKER_PROBE`]. A skipped wake is logged as [`W_RECALL_CAP`].
@@ -1835,13 +1836,19 @@ impl Advisor {
             wake.epoch as i64,
             now - REJECT_DAYS * DAY_SECONDS,
         );
+        let phase = wake.ledger_phase();
+        let injects = self.injects();
         let seen: Vec<RecallRow> = match seen {
-            // On mode delivers what a shadow mid wake only logged: its rows hide nothing.
-            Ok(seen) if self.injects() => seen
+            Ok(seen) => seen
                 .into_iter()
-                .filter(|row| !(row.state == RecallState::Shadow && row.phase == RecallPhase::Mid))
+                // A reject judged one kind of wake text (the owner's message, or the lead's
+                // tool events and plan): it keeps an entry only from wakes of the same kind.
+                .filter(|row| row.state != RecallState::Rejected || row.phase == phase)
+                // On mode delivers what a shadow mid wake only logged: its rows hide nothing.
+                .filter(|row| {
+                    !(injects && row.state == RecallState::Shadow && row.phase == RecallPhase::Mid)
+                })
                 .collect(),
-            Ok(seen) => seen,
             Err(err) => {
                 tracing::warn!(
                     code = err.code(),

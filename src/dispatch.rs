@@ -477,6 +477,9 @@ pub struct Dispatcher {
     session_asked: Mutex<HashMap<String, Instant>>,
     /// Command rows that confirmed their conversation's open new-session question on arrival.
     session_confirmed: Mutex<std::collections::HashSet<i64>>,
+    /// Owner rows whose correction capture ran on arrival ([`lessons::capture`]) and that were
+    /// queued, with the note it gave: the worker reuses it instead of capturing the row again.
+    captured: Mutex<HashMap<i64, Option<String>>>,
     /// What the start check found about omp; a warning is sent to the owner once per version.
     omp_check: Option<OverlayCheck>,
     /// `[memory.self]`: owner corrections are captured with it ([`lessons::capture`]).
@@ -515,6 +518,7 @@ impl Dispatcher {
             forget_asked: Mutex::default(),
             session_asked: Mutex::default(),
             session_confirmed: Mutex::default(),
+            captured: Mutex::default(),
             omp_check: None,
             self_config: config.memory.self_file.clone(),
             recall_modes: (
@@ -1026,8 +1030,9 @@ impl Dispatcher {
                 }
             }
         }
-        // The same body the worker would send for this row, with the correction note: when it
-        // is not steered, the worker captures it again, which saves and counts nothing twice.
+        // The same body the worker would send for this row, with the correction note. The
+        // capture runs once per row: it is kept for the worker (before the steer, so a worker
+        // that takes the row at once finds it) and dropped when the row is steered.
         let mut body = lead::owner_input(
             key.as_str(),
             id,
@@ -1035,9 +1040,12 @@ impl Dispatcher {
         );
         if sender == Sender::Owner
             && let Some(memory) = &self.memory
-            && let Some(note) = lessons::capture(memory, &self.self_config, id, &event.text)
         {
-            body = format!("{body}\n\n{note}");
+            let note = lessons::capture(memory, &self.self_config, id, &event.text);
+            if let Some(note) = &note {
+                body = format!("{body}\n\n{note}");
+            }
+            lock(&self.captured).insert(id, note);
         }
         let mut claim_error = None;
         let steered = self.omp.try_steer(key.as_str(), id, sender, &body, |main| {
@@ -1047,6 +1055,7 @@ impl Dispatcher {
             })
         });
         if steered {
+            lock(&self.captured).remove(&id);
             return Ok(Handled::Steered(id));
         }
         tracing::info!(row = id, conversation = key.as_str(), "message queued");
@@ -1103,6 +1112,8 @@ impl Dispatcher {
             }
             row
         };
+        // Taken whatever happens to the row below, so no capture is left behind.
+        let captured = lock(&self.captured).remove(&row.id);
         let key = row.conversation_key.as_str();
         let from_owner = row.origin == "owner";
         if !from_owner && self.stale_news(&row)? {
@@ -1180,9 +1191,15 @@ impl Dispatcher {
             };
             let mut input =
                 lead::owner_input(key, row.id, &files::prompt_with_files(&row.text, &saved));
-            if let Some(memory) = &self.memory
-                && let Some(note) = lessons::capture(memory, &self.self_config, row.id, &row.text)
-            {
+            // A row queued after an arrival capture reuses it; one queued before a restart is
+            // captured now (the same source saves nothing twice).
+            let note = match captured {
+                Some(note) => note,
+                None => self.memory.as_ref().and_then(|memory| {
+                    lessons::capture(memory, &self.self_config, row.id, &row.text)
+                }),
+            };
+            if let Some(note) = note {
                 input = format!("{input}\n\n{note}");
             }
             match self

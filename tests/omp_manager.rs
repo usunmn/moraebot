@@ -3685,9 +3685,24 @@ async fn mid_wakes_write_shadow_and_rejected_ledger_rows() {
         "gen=1 epoch=0 row=1 offered=1 picks= rejected=1 unoffered=0 blocked=0 phase=mid mode=on"
     ));
     assert!(
-        ledger_rows(&h, 1).contains(&(x, "rejected".to_owned())),
+        ledger_rows(&h, 1).contains(&(x.clone(), "rejected".to_owned())),
         "{:?}",
         ledger_rows(&h, 1)
+    );
+    m.shutdown_all().await;
+
+    // The reject judged tool events, not a message: a later owner wake (on a new lead child,
+    // so this turn's own offers are gone) is still offered the entry.
+    let asked = advisor_prompts(&h).len();
+    let m = h.manager("ok").with_recall(Arc::clone(&advisor));
+    let input = lead::owner_input(KEY_A, 2, "why do curl calls hang?");
+    bounded(m.prompt(KEY_A, 2, Sender::Owner, &input)).await;
+    wakes_done(&mut progress, MID_TURN_WAKES + 1).await;
+    let later = advisor_prompts(&h);
+    assert!(
+        later[asked..].iter().any(|p| p.contains(&x)),
+        "{:?}",
+        &later[asked..]
     );
     m.shutdown_all().await;
 }
