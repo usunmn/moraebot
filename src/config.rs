@@ -348,6 +348,8 @@ pub struct MemoryConfig {
     pub self_file: SelfConfig,
     /// `[memory.recall]`.
     pub recall: RecallConfig,
+    /// `[memory.curate]`.
+    pub curate: CurateConfig,
 }
 
 impl MemoryConfig {
@@ -512,6 +514,71 @@ impl Default for RecallConfig {
             mid_max_delivered: 2,
             mid_cooldown_minutes: 10,
         }
+    }
+}
+
+/// What the memory curator does ([`crate::curate`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CurateMode {
+    /// No curator runs.
+    Off,
+    /// The curator runs and its checked changes are only logged, never applied.
+    Shadow,
+    /// The curator runs while the lead is idle and applies its checked changes. The default.
+    On,
+}
+
+impl CurateMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Shadow => "shadow",
+            Self::On => "on",
+        }
+    }
+
+    fn parse(text: &str) -> Result<Self, ConfigError> {
+        match text {
+            "off" => Ok(Self::Off),
+            "shadow" => Ok(Self::Shadow),
+            "on" => Ok(Self::On),
+            other => Err(ConfigError::new(
+                E_CONFIG_VALUE,
+                format!("memory.curate.mode '{other}' must be \"off\", \"shadow\" or \"on\""),
+            )),
+        }
+    }
+}
+
+/// The `[memory.curate]` settings: the memory curator ([`crate::curate`]).
+#[derive(Debug, Clone, PartialEq)]
+pub struct CurateConfig {
+    pub mode: CurateMode,
+    /// The omp model of the curator (`--model`); an omp model role such as `@smol` (the
+    /// default) or a model name; empty is omp's default model.
+    pub model: String,
+    /// How long the lead must have been idle before a run, in minutes.
+    pub idle_minutes: u64,
+    /// The shortest time between two runs, in minutes.
+    pub min_minutes_between: u64,
+}
+
+impl Default for CurateConfig {
+    fn default() -> Self {
+        Self {
+            mode: CurateMode::On,
+            model: DEFAULT_RECALL_MODEL.to_owned(),
+            idle_minutes: 30,
+            min_minutes_between: 120,
+        }
+    }
+}
+
+impl CurateConfig {
+    /// `model`, or `None` when it is empty (omp's default model then).
+    pub fn model(&self) -> Option<&str> {
+        let model = self.model.trim();
+        (!model.is_empty()).then_some(model)
     }
 }
 
@@ -784,6 +851,21 @@ struct MemorySection {
     self_file: Option<SelfSection>,
     #[serde(skip_serializing_if = "Option::is_none")]
     recall: Option<RecallSection>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    curate: Option<CurateSection>,
+}
+
+#[derive(Debug, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct CurateSection {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mode: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    idle_minutes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    min_minutes_between: Option<u64>,
 }
 
 #[derive(Debug, Default, Deserialize, Serialize)]
@@ -908,11 +990,19 @@ impl MemoryConfig {
                 ]
             );
         }
+        let mut curate = CurateConfig::default();
+        if let Some(section) = section.curate {
+            if let Some(mode) = section.mode.as_deref() {
+                curate.mode = CurateMode::parse(mode)?;
+            }
+            take!(curate, section, [model, idle_minutes, min_minutes_between]);
+        }
         let memory = Self {
             ignored,
             filter,
             self_file,
             recall,
+            curate,
         };
         memory.check_values()?;
         Ok(memory)
@@ -967,6 +1057,15 @@ impl MemoryConfig {
                 "memory.recall.mid_task = \"on\" needs memory.recall.mode = \"on\"".to_owned(),
             );
         }
+        let c = &self.curate;
+        for (name, value) in [
+            ("idle_minutes", c.idle_minutes),
+            ("min_minutes_between", c.min_minutes_between),
+        ] {
+            if value == 0 {
+                return bad(format!("memory.curate.{name} must be greater than zero"));
+            }
+        }
         Ok(())
     }
 
@@ -1002,13 +1101,49 @@ impl MemoryConfig {
             mid_max_wakes_per_turn: None,
             mid_min_interval_seconds: None,
         };
+        let (c, dc) = (&self.curate, CurateConfig::default());
+        let curate = CurateSection {
+            mode: changed(&c.mode, &dc.mode).map(|mode| mode.as_str().to_owned()),
+            model: changed(&c.model, &dc.model),
+            idle_minutes: changed(&c.idle_minutes, &dc.idle_minutes),
+            min_minutes_between: changed(&c.min_minutes_between, &dc.min_minutes_between),
+        };
         let section = MemorySection {
             jev: None,
             filter: (!is_empty_section(&filter)).then_some(filter),
             self_file: (!is_empty_section(&self_file)).then_some(self_file),
             recall: (!is_empty_section(&recall)).then_some(recall),
+            curate: (!is_empty_section(&curate)).then_some(curate),
         };
         (!is_empty_section(&section)).then_some(section)
+    }
+
+    /// The `check-config` line for the memory curator. Advisory: an empty model only means
+    /// the curator runs on omp's default model.
+    fn curate_check(&self) -> Check {
+        let c = &self.curate;
+        let result = match (c.mode, c.model()) {
+            (CurateMode::Off, _) => Ok("off".to_owned()),
+            (mode, Some(model)) => Ok(format!(
+                "{}, model {model}, after {} idle minutes, at most every {} minutes",
+                mode.as_str(),
+                c.idle_minutes,
+                c.min_minutes_between
+            )),
+            (mode, None) => Err(ConfigError::new(
+                E_CONFIG_VALUE,
+                format!(
+                    "{} without memory.curate.model: the curator runs on omp's default model; \
+                     set a small fast model there",
+                    mode.as_str()
+                ),
+            )),
+        };
+        Check {
+            name: "memory.curate",
+            result,
+            advisory: true,
+        }
     }
 
     /// The `check-config` line for the recall advisor. Advisory: an empty model only means
@@ -1442,6 +1577,7 @@ impl Config {
         }
         checks.extend(self.memory.ignored_check());
         checks.push(self.memory.recall_check());
+        checks.push(self.memory.curate_check());
         checks.extend([
             Check {
                 name: "work_dir",
@@ -2130,6 +2266,54 @@ mod tests {
             "max_items = 40",
         ] {
             assert_eq!(code(fx.load(&with(bad))), E_CONFIG_VALUE, "{bad}");
+        }
+    }
+
+    #[test]
+    fn memory_curate_is_on_by_default_and_round_trips() {
+        let fx = Fixture::new();
+        let plain = fx.load(&fx.valid_toml()).expect("loads");
+        assert_eq!(plain.memory.curate, CurateConfig::default());
+        assert_eq!(plain.memory.curate.mode, CurateMode::On);
+        assert_eq!(plain.memory.curate.model(), Some("@smol"));
+        assert_eq!(plain.memory.curate.idle_minutes, 30);
+        assert_eq!(plain.memory.curate.min_minutes_between, 120);
+        assert!(!plain.to_toml().expect("toml").contains("curate"));
+        let curate_line = |cfg: &Config| {
+            cfg.checks()
+                .into_iter()
+                .find(|c| c.name == "memory.curate")
+                .expect("curate check")
+                .result
+                .map_err(|e| e.code)
+        };
+        assert_eq!(
+            curate_line(&plain),
+            Ok("on, model @smol, after 30 idle minutes, at most every 120 minutes".to_owned())
+        );
+
+        let with = |body: &str| format!("{}[memory.curate]\n{body}\n", fx.valid_toml());
+        let cfg = fx
+            .load(&with(
+                "mode = \"shadow\"\nmodel = \"qa-small\"\nidle_minutes = 5\nmin_minutes_between = 60",
+            ))
+            .expect("loads");
+        assert_eq!(cfg.memory.curate.mode, CurateMode::Shadow);
+        assert_eq!(cfg.memory.curate.model(), Some("qa-small"));
+        let written = cfg.to_toml().expect("serializes");
+        assert!(written.contains("[memory.curate]"), "{written}");
+        assert_eq!(fx.load(&written).expect("reloads").memory, cfg.memory);
+        let off = fx.load(&with("mode = \"off\"")).expect("loads");
+        assert_eq!(curate_line(&off), Ok("off".to_owned()));
+        let empty = fx.load(&with("model = \"\"")).expect("loads");
+        assert_eq!(curate_line(&empty), Err(E_CONFIG_VALUE));
+        for bad in [
+            "mode = \"live\"",
+            "idle_minutes = 0",
+            "min_minutes_between = 0",
+            "every = 3",
+        ] {
+            assert!(fx.load(&with(bad)).is_err(), "{bad}");
         }
     }
 

@@ -5,6 +5,7 @@ pub mod adapter;
 pub mod bridge;
 pub mod chat;
 pub mod config;
+pub mod curate;
 pub mod discord;
 pub mod dispatch;
 pub mod done;

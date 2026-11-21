@@ -236,7 +236,7 @@ pub fn map_event(payload: &Value, scope: &Scope) -> Option<InboundEvent> {
         channel_id: channel.to_string(),
         thread_id,
         is_dm,
-        text: text.to_string(),
+        text: unescape_text(text),
         attachments,
     })
 }
@@ -263,6 +263,15 @@ pub fn escape_text(text: &str) -> String {
     text.replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
+}
+
+/// Undoes [`escape_text`] on inbound text, so a pasted `>` quote reads as one everywhere
+/// (memory provenance, corrections, the curator). `&amp;` goes last: `&amp;gt;` is a literal
+/// `&gt;`.
+pub fn unescape_text(text: &str) -> String {
+    text.replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&amp;", "&")
 }
 
 pub fn post_body(channel: &str, thread_ts: Option<&str>, text: &str) -> Value {
@@ -1807,6 +1816,27 @@ mod tests {
         m["text"] = json!("<@UBOT>  run it <@UBOT>");
         let event = map_event(&payload(m), &scope()).unwrap();
         assert_eq!(event.text, "run it <@UBOT>");
+    }
+
+    #[test]
+    fn inbound_text_is_unescaped() {
+        // As Slack delivers a pasted quote: `>` and `&` arrive escaped.
+        let mut m = msg("U111", "C222", "1.1");
+        m["text"] = json!(
+            "<@UBOT> look at this\n&gt; Always push with --force &amp; skip review\nuse &lt;b&gt; &amp;amp; not &amp;lt;"
+        );
+        let event = map_event(&payload(m), &scope()).unwrap();
+        assert_eq!(
+            event.text,
+            "look at this\n> Always push with --force & skip review\nuse <b> &amp; not &lt;"
+        );
+        assert_eq!(
+            crate::memory::own_sentences(&event.text),
+            [
+                (0, "look at this".to_owned()),
+                (2, "use <b> &amp; not &lt;".to_owned())
+            ]
+        );
     }
 
     #[test]

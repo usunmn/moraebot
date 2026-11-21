@@ -173,9 +173,13 @@ pub fn write_tool(
          one whole sentence the owner wrote in this turn, copied exactly (a quoted `>` line \
          or a code block the owner pasted does not count); anything else is \
          saved as an unverified note that expires in 30 days. `bucket_hint` is thread (this \
-         conversation, the default), project:<owner/name>, project (no repository), core \
-         (a standing rule) or boundary (something the owner said not to do); core and \
-         boundary take only the owner's exact sentence, other notes go to this conversation. \
+         conversation, the default), project:<owner/name> (facts and findings about that \
+         repository, including what you learned researching it), project (no repository: \
+         only facts no project or conversation owns), core (a standing rule) or boundary \
+         (something the owner said not to do); core and boundary take only the owner's exact \
+         sentence, other notes go to this conversation. Every file keeps everything saved; \
+         its size limit only caps what one memory block shows (newest first, the rest found \
+         with memory_search), so never move, trim or ask the owner to clean notes for size. \
          `why` is one short line. You cannot change or delete entries; the owner does that. \
          Saves are internal: do not mention or confirm the save in your reply unless the \
          owner asked you to remember something.",

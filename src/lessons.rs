@@ -182,7 +182,7 @@ pub fn note(count: usize, earlier: &[Entry], id: &str, today: memory::Day, text:
 
 /// The words of `text`, lowercased: the runs of letters, digits and `_` between every other
 /// character, so "whenever" is one word and "never." holds "never".
-fn words(text: &str) -> Vec<String> {
+pub(crate) fn words(text: &str) -> Vec<String> {
     text.to_lowercase()
         .split(|c: char| !c.is_alphanumeric() && c != '_')
         .filter(|w| !w.is_empty())

@@ -133,7 +133,8 @@ use crate::adapter::{
     MessengerAdapter, split_reply,
 };
 use crate::chat::{self, ChatFile, ChatManager};
-use crate::config::{Config, SelfConfig};
+use crate::config::{Config, CurateMode, SelfConfig};
+use crate::curate::{CurateAction, CurateOp, Curator, RunReport};
 use crate::files::{self, OutFile, SavedFile};
 use crate::gateway::{E_GATEWAY_TASK, GatewayError};
 use crate::lane::{LaneManager, LaneNews};
@@ -194,6 +195,9 @@ pub const E_LANE_NEWS_STALE: &str = "E_LANE_NEWS_STALE";
 /// whose hello names no `home`).
 pub const W_NO_HOME_CHANNEL: &str = "W_NO_HOME_CHANNEL";
 
+/// How often the memory curator task asks whether a run is due.
+pub const CURATE_TICK: Duration = Duration::from_secs(60);
+
 /// Longer replies are cut with a note.
 pub const MAX_REPLY_MESSAGES: usize = 10;
 
@@ -246,6 +250,51 @@ pub fn notice_text(code: &str) -> &'static str {
         }
         _ => "Something went wrong.",
     }
+}
+
+/// The owner's DM line after a curator run whose applied changes touched core memory: the
+/// changed ids and the commands that undo them; `None` when no change touched core.
+pub fn curate_core_notice(lang: status::Lang, actions: &[CurateAction]) -> Option<String> {
+    let core: Vec<&CurateAction> = actions
+        .iter()
+        .filter(|a| a.core && a.op != CurateOp::Conflict)
+        .collect();
+    if core.is_empty() {
+        return None;
+    }
+    let changed: Vec<String> = core
+        .iter()
+        .map(|a| {
+            let op = match (lang, a.op) {
+                (status::Lang::Korean, CurateOp::Promote) => "핵심으로 올림",
+                (status::Lang::Korean, CurateOp::Demote) => "핵심에서 내림",
+                (status::Lang::Korean, CurateOp::Replace) => "교체",
+                (status::Lang::Korean, _) => "바꿈",
+                (status::Lang::English, CurateOp::Promote) => "promoted",
+                (status::Lang::English, CurateOp::Demote) => "moved out",
+                (status::Lang::English, CurateOp::Replace) => "replaced",
+                (status::Lang::English, _) => "changed",
+            };
+            format!("{op} {}", a.entry_id)
+        })
+        .collect();
+    let undo: Vec<String> = core
+        .iter()
+        .filter_map(|a| memory_commands::curate_undo(lang, a.op.as_str(), &a.entry_id))
+        .map(|undo| format!("`{undo}`"))
+        .collect();
+    let changed = changed.join(", ");
+    let undo = undo.join(", ");
+    Some(match (lang, undo.is_empty()) {
+        (status::Lang::Korean, false) => {
+            format!("기억 정리로 핵심 기억이 바뀌었어요: {changed}. 되돌리려면 {undo}")
+        }
+        (status::Lang::Korean, true) => format!("기억 정리로 핵심 기억이 바뀌었어요: {changed}."),
+        (status::Lang::English, false) => {
+            format!("Memory tidy changed core memory: {changed}. To undo: {undo}.")
+        }
+        (status::Lang::English, true) => format!("Memory tidy changed core memory: {changed}."),
+    })
 }
 
 /// The [`N_TURN_STALLED`] notice text for a stall of `minutes`.
@@ -409,6 +458,8 @@ enum MemoryAct {
     Confirm(String, bool),
     /// The recent-recalls command, in the owner's language.
     Recalls(status::Lang),
+    /// The recent-cleanup command, in the owner's language.
+    Cleanup(status::Lang),
 }
 
 /// How often a conversation saw an owner message, a delivered reply or posted news, and
@@ -486,6 +537,10 @@ pub struct Dispatcher {
     self_config: SelfConfig,
     /// `memory.recall.mode` and the mid-task mode, for the status answer.
     recall_modes: (&'static str, &'static str),
+    /// `memory.curate.mode`, for the status answer.
+    curate_mode: CurateMode,
+    /// The memory curator run by [`Self::run`]; `None` with `memory.curate.mode = off`.
+    curator: Option<Arc<Curator>>,
 }
 
 impl Dispatcher {
@@ -525,12 +580,21 @@ impl Dispatcher {
                 config.memory.recall_mode().as_str(),
                 config.memory.recall_mid_task().as_str(),
             ),
+            curate_mode: config.memory.curate.mode,
+            curator: None,
         }
     }
 
     /// Turns on the owner memory commands, served by `memory`.
     pub fn with_memory(mut self, memory: MemoryHandle) -> Self {
         self.memory = Some(memory);
+        self
+    }
+
+    /// Runs `curator` in [`Self::run`]: every [`CURATE_TICK`] a due run is done
+    /// ([`Curator::due`] with the lead's idle time), one at a time.
+    pub fn with_curator(mut self, curator: Curator) -> Self {
+        self.curator = Some(Arc::new(curator));
         self
     }
 
@@ -700,7 +764,71 @@ impl Dispatcher {
             let this = Arc::clone(&self);
             async move { this.news_loop().await }
         });
+        if let Some(curator) = self.curator.clone() {
+            tasks.spawn("memory curator", {
+                let this = Arc::clone(&self);
+                async move { this.curate_loop(curator).await }
+            });
+        }
         self.serve(inbound, tasks).await
+    }
+
+    /// Every [`CURATE_TICK`] (the first at once), runs `curator` when it is due; a run is
+    /// awaited before the next check, so two never overlap. Never ends.
+    async fn curate_loop(&self, curator: Arc<Curator>) {
+        let mut tick = tokio::time::interval(CURATE_TICK);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tick.tick().await;
+            let now = unix_now();
+            if !curator.due(self.omp.lead_idle(), now) {
+                continue;
+            }
+            let report = curator.run_once(now).await;
+            self.tell_curated(&report).await;
+        }
+    }
+
+    /// Sends the owner one DM line ([`curate_core_notice`]) when an applied change of
+    /// `report` touched core memory, in the language of the changed entries (Korean when one
+    /// holds Hangul). Nothing in shadow mode, nothing when the owner's DM cannot be opened.
+    async fn tell_curated(&self, report: &RunReport) {
+        if self.curate_mode != CurateMode::On {
+            return;
+        }
+        let korean = report.actions.iter().filter(|a| a.core).any(|a| {
+            self.memory
+                .as_ref()
+                .and_then(|memory| memory.show(&a.entry_id).ok().flatten())
+                .is_some_and(|found| {
+                    found
+                        .entry
+                        .text
+                        .chars()
+                        .any(|c| matches!(c, '\u{AC00}'..='\u{D7A3}'))
+                })
+        });
+        let lang = if korean {
+            status::Lang::Korean
+        } else {
+            status::Lang::English
+        };
+        let Some(text) = curate_core_notice(lang, &report.actions) else {
+            return;
+        };
+        let target = match self.adapter.open_dm(&self.owner_id).await {
+            Ok(target) => target,
+            Err(err) => {
+                tracing::warn!(
+                    code = err.code,
+                    "owner DM not opened; curator notice skipped"
+                );
+                return;
+            }
+        };
+        if let Err(err) = self.adapter.send(&target, &text).await {
+            tracing::warn!(code = err.code, "curator notice send failed");
+        }
     }
 
     /// Serves inbound events until `inbound` closes or one of `tasks` ends, then stops the
@@ -1257,7 +1385,8 @@ impl Dispatcher {
                 memory_commands::confirmation(text).map(|yes| MemoryAct::Confirm(target, yes))
             })
             .or_else(|| memory_commands::parse(text).map(MemoryAct::Run))
-            .or_else(|| memory_commands::recent_recalls_request(text).map(MemoryAct::Recalls));
+            .or_else(|| memory_commands::recent_recalls_request(text).map(MemoryAct::Recalls))
+            .or_else(|| memory_commands::recent_cleanup_request(text).map(MemoryAct::Cleanup));
         let Some(act) = act else {
             if arrival {
                 lock(&self.forget_asked).remove(key);
@@ -1278,6 +1407,12 @@ impl Dispatcher {
                     .store()
                     .recent_recalls(memory_commands::RECENT_RECALLS)?;
                 memory_commands::recent_recalls(memory, lang, &rows, unix_now())
+            }
+            MemoryAct::Cleanup(lang) => {
+                let rows = self
+                    .store()
+                    .recent_curate_log(memory_commands::RECENT_CLEANUP)?;
+                memory_commands::recent_cleanup(memory, lang, &rows, unix_now())
             }
             MemoryAct::Run(command) => {
                 let answer = memory_commands::run(memory, key, id, command).await;
@@ -1424,7 +1559,11 @@ impl Dispatcher {
                 task: &lane.task,
             })
             .collect();
-        Ok(status::reply(
+        let curate = match self.curate_mode {
+            CurateMode::Off => None,
+            _ => Some(self.store().curate_status()?),
+        };
+        let reply = status::reply(
             lang,
             key,
             lead.as_ref(),
@@ -1433,6 +1572,10 @@ impl Dispatcher {
             &lanes,
             others.len(),
             &|text| self.omp.clean_note(text),
+        );
+        Ok(format!(
+            "{reply}\n{}",
+            status::curate_line(lang, curate.as_ref(), unix_now())
         ))
     }
 

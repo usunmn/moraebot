@@ -4329,7 +4329,7 @@ async fn queued_status_question_is_answered_by_the_worker() {
         [(
             "444".to_owned(),
             format!(
-                "Not working on anything right now.\nBackground lanes of this conversation: 1\n- lane {lane}: fix ./src\nPrompt cache: no usage measured yet.\nRecall: on (mid-task on), 0 calls in the last hour, last delivered pick never."
+                "Not working on anything right now.\nBackground lanes of this conversation: 1\n- lane {lane}: fix ./src\nPrompt cache: no usage measured yet.\nRecall: on (mid-task on), 0 calls in the last hour, last delivered pick never.\nMemory tidy: not run yet."
             )
         )]
     );

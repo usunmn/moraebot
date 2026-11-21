@@ -37,6 +37,7 @@ Only messages from you (the owner) are checked, and only ones without attachment
 | `m-1a2b3c 되살려`, `restore m-1a2b3c` | Brings a forgotten entry back. |
 | `refresh memory`, `기억 새로고침` (the whole message) | Sets the lead's system prompt again before its next turn, with the current persona and core memory, instead of waiting for its prompt cache to go cold ([Prompt cache](#prompt-cache)). moraebot answers it like a status question. |
 | `recent recalls`, `최근 떠올린 기억` (the whole message) | Lists the last 10 rows of the recall ledger, from every conversation, newest first: how long ago, the wake (`owner` or `mid`), the state (`delivered`, `shadow`, `rejected`), the entry id and the entry's current text, or `(gone)` when it was forgotten, replaced or removed ([The recall advisor](#the-recall-advisor)). |
+| `recent cleanup`, `최근 정리` (the whole message) | Lists the last 20 changes of the memory tidy ([Memory tidy (curator)](#memory-tidy-curator)), newest first: how long ago, the change, the entry ids, the entry's current text or `(gone)`, and the command that undoes it. A conflict whose two entries are both still there shows both texts and the `m-a 지워` / `m-a 고쳐:` hint; one you already settled says `(settled)`. |
 
 A message the rules don't match (a sentence that only mentions an id, a question such as `기억해?`, a bare `X 기억해`, often a question without the `?`, or a request in your own words such as "아까 그 회의 얘기 이제 잊어줘") goes to the lead as usual. moraebot never posts a save in the chat: when the lead saves a note (`memory_write` below), a core rule and a boundary included, nothing is added to the reply or sent on its own, whether the turn replied, failed or was interrupted. `뭐 기억해?` lists the core rules, the boundaries and what this conversation got, with their ids, so you can check a save and forget a wrong one. Each save is logged as `I_MEMORY_SAVED` with its id, file and bucket (never its text), in moraebot's log. The lead's save stands however the turn ends.
 
@@ -179,9 +180,39 @@ Left unset, the mode is `on`, on `memory.recall.model = "@smol"` (omp's small fa
 
 How well it picks is measured offline on a fixed set of synthetic conversations, against no advisor and against plain `memory_search`: see [Recall advisor eval](recall-eval.md).
 
+## Memory tidy (curator)
+
+moraebot tidies saved memory on its own, so you don't have to type commands to keep it useful. It runs in the background while the lead is idle.
+
+**When.** A run is due when `memory.curate.mode` is not `off`, no lead turn is running and the last one ended at least `idle_minutes` ago (30), at least `min_minutes_between` (120) passed since the last run, and either you sent new messages since then or the last run is older than 24 hours. moraebot checks this once a minute and never runs two at once.
+
+**What it reads.** One run is at most two calls to omp on `memory.curate.model` (`@smol`), with no tools:
+- The owner pass reads your own sentences from your finished messages since the last run (at most 200 messages, 48 KiB, 2 KiB each; quoted and pasted lines are left out), each with its local date and conversation. As context it shows the lead's message you were answering (its previous reply in that conversation, even from before the last run; 600 characters, never saved), only when that turn read nothing from outside. It also sees your own entries in core, the projects, `_general` and the conversations, never the boundaries, `self/` or the archive: at most 150 of them and 24 KiB, core first, then entries that share words with the messages, then the newest.
+- The reference pass reads only the entries that are not yours (lane results, tool lines) and nothing else. When it fails, only its own changes are lost.
+
+The very first run reads only your messages of the last 30 days, and each saved sentence is dated the day you sent it.
+
+Everything sent is redacted like the recall advisor's input.
+
+**What it may do.** The model only proposes; code checks every change against what was read and drops the ones that fail (logged as `W_CURATE_DROPPED`), the others still apply.
+- *save* one of your sentences word for word in that conversation's file, or in a project's file when the message was not a DM and names that project. Never in core, the boundaries or `self/`. A sentence needs at least 2 words or 8 characters and must pass the `[memory.filter]` lists (no credentials, links, commands or approvals); one already saved, or whose text is already live, is not saved again. It may carry an end date up to 90 days ahead (a blank one means none).
+- *replace* an older entry of yours with a newer one that says nearly the same thing (the old one is archived as replaced). Usually both are of one file, but a correction you gave in another conversation may replace an entry of another file; when the old entry was in core, the newer one moves into core in its place (one more core change). When the two are not similar enough, or the core has no room for the newer one, it becomes a conflict.
+- *conflict*: two of your entries disagree. Nothing changes; you see it in `최근 정리` and the status answer.
+- *promote* one of your conversation entries into core, word for word, only when code finds you said it again: closely similar sentences (not questions) on at least two days other than the message it came from, or the recall advisor delivered it to at least 3 lead sessions within 30 days. Project and `_general` entries are never promoted: the lanes read them and never read core. An entry from a DM may be promoted too, so it is remembered everywhere; the DM line about core changes lets you undo it. Core must still fit the size the lead's prompt gives it, and at most 3 core changes (promotions, demotions, and replaces and unsaves of core entries) happen in any 24 hours. It may later move back out only an entry it promoted itself.
+- *unsave* only an entry it saved itself (archived, so `되살려` brings it back), and never one that replaced another entry.
+- *forget* or *replace* entries that are not yours (reference pass).
+
+It never touches the boundaries or `self/`, never forgets one of your entries, never makes a new project file and never moves an entry where more conversations can see it except into core as above. A change you undid (an entry you brought back, a promotion you moved back) is never made again. At most 30 changes per run. Each run writes its changes to the log as pending before it touches memory and settles them afterwards, so a crash in between never leaves a change out of `최근 정리`.
+
+**Failures.** A failed owner pass (the call fails or the answer is not a plan) on new messages counts as a failure (`W_CURATE_FAILED`); after two failures on the same messages the next run reads only half of them (and half the entries), and a third failure skips them (`W_CURATE_SKIPPED`, a `skipped` row in `최근 정리`), so new messages are never stuck behind them. A failed reference pass is only logged (`W_CURATE_REFERENCE_FAILED`). When the memory batch fails as a whole, nothing is logged and the same messages are read again next run. Each run ends with `I_CURATE_RUN` in moraebot's log.
+
+**What you see.** `최근 정리` / `recent cleanup` lists the changes ([Commands](#commands)). The status answer has one line, for example `Memory tidy: last run 2 h ago, saved 3, replaced 2, promoted 1, conflicts 1.` (`기억 정리: 마지막 실행 2시간 전, 저장 3, ...`), with the failures of the current messages when there are any, or `off`. When an applied change touched core, moraebot sends you one DM line naming the ids and the command that undoes each (`m-id 되살려` for a replaced entry, `m-id 지워` for a promoted one); nothing is sent when your DM cannot be opened. The lead is told that moraebot tidies memory while it is idle, and to save your correcting sentence with `memory_write` when you correct something it remembered, so the old line can be replaced.
+
+**Shadow and off.** `mode = "shadow"` runs the same calls and checks but only logs the changes (marked `(shadow)` in `최근 정리`; no DM). `mode = "off"` runs nothing.
+
 ## What leaves this machine
 
-Nothing goes to a service outside your own omp model provider. The recall advisor runs on this machine through omp on `memory.recall.model`; an advisor call sends the provider your redacted message, the redacted candidate entries and its fixed prompt, and a mid wake also the redacted tool event lines described in [Mid-task recall](#mid-task-recall). Correction capture runs no model at all.
+Nothing goes to a service outside your own omp model provider. The recall advisor runs on this machine through omp on `memory.recall.model`; an advisor call sends the provider your redacted message, the redacted candidate entries and its fixed prompt, and a mid wake also the redacted tool event lines described in [Mid-task recall](#mid-task-recall). The memory tidy also runs through omp, on `memory.curate.model`, and sends the provider the redacted text described in [Memory tidy (curator)](#memory-tidy-curator). Correction capture runs no model at all.
 
 A config.toml from an older version may still hold a `[memory.jev]` table: moraebot ignores it (whatever keys it has), logs `W_CONFIG_IGNORED` naming it, and `check-config` prints one `WARN memory` line; remove the table to silence it. The `TYPESAFE_API_KEY` variable is no longer read.
 
@@ -208,6 +239,10 @@ Every key is optional.
 | `memory.recall.mid_cooldown_minutes` | 10 | The window of `mid_max_delivered` (at least 1). |
 | `memory.recall.wait_ms` | 2500 | On mode: how long a turn of yours waits for the advisor before it starts without the picks (0 to 10000; 0 never waits, so every pick goes with your next message). |
 | `memory.self.correction_patterns` | built in (`몇 번 말해`, `몇 번을 말해`, `몇 번째 말하`, `왜 또`, `또 그러`, `그러지 마`, `하지 말라고 했`, `I told you`, `why did you … again`, `stop doing`, `don't do that again`) | Phrases that make your message a correction of moraebot ([Corrections](#corrections)): words in order, the last one as a word start, `…` for any words between, case ignored. The list replaces the built-in one. |
+| `memory.curate.mode` | `on` | `"on"` lets the memory tidy apply its checked changes ([Memory tidy (curator)](#memory-tidy-curator)); `"shadow"` only logs them; `"off"` runs none. |
+| `memory.curate.model` | `@smol` | The omp model (`--model`) of the memory tidy, a model role or name; empty is omp's default model. |
+| `memory.curate.idle_minutes` | 30 | How long the lead must have been idle before a run (at least 1). |
+| `memory.curate.min_minutes_between` | 120 | The shortest time between two runs (at least 1). |
 
 Each filter list replaces its built-in list. A pattern of only ASCII letters, digits and `_` must match a whole word; any other pattern (Korean ones included) matches anywhere. Case is ignored. Sentences are NFKC-normalized first, so full-width and mathematical letters and other compatibility forms are matched as their plain letters, and look-alikes of `.`, `/`, `|` and `:` as those characters. A lane sentence is not counted as a lane line when it holds an invisible or combining character (zero-width or bidi marks, variation selectors, combining accents), a word that mixes Latin with Cyrillic or Greek letters (a Cyrillic `о` in "owner"), or Hangul typed as conjoining jamo, so none of these can hide a listed word.
 

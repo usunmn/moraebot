@@ -18,7 +18,8 @@ use tokio::sync::{mpsc, watch};
 use tokio::task::JoinError;
 
 use crate::adapter::{AdapterError, MessengerAdapter};
-use crate::config::{Config, ConfigError, RecallMode};
+use crate::config::{Config, ConfigError, CurateMode, RecallMode};
+use crate::curate::Curator;
 use crate::dispatch::Dispatcher;
 use crate::hints;
 use crate::lead;
@@ -86,6 +87,8 @@ pub struct Gateway {
     omp: OmpManager,
     /// What the start check found about omp (`None` in tests that skip the check).
     omp_check: Option<OverlayCheck>,
+    /// The memory curator, run by the dispatcher; `None` with `memory.curate.mode = off`.
+    curator: Option<Curator>,
 }
 
 impl Gateway {
@@ -96,7 +99,8 @@ impl Gateway {
     /// old 0.2.0 layout with `E_MEMORY_OLD_LAYOUT`) and starts its writer thread, which
     /// serves the owner's memory commands, and writes the omp overlay the lead and lanes run
     /// with (`E_OMP_OVERLAY` when it cannot); nothing else is started yet. The memory store
-    /// and the recall advisor share one redactor. Memory log and recall ledger rows older than
+    /// and the recall advisor share one redactor, and so does the memory curator, built unless
+    /// `memory.curate.mode = off`. Memory log and recall ledger rows older than
     /// 30 days are pruned here.
     pub fn open(config: &Config, adapter: Arc<dyn MessengerAdapter>) -> Result<Self, GatewayError> {
         omp_overlay::write_overlay(&config.home)?;
@@ -114,6 +118,8 @@ impl Gateway {
             redactor.clone(),
             memory::system_clock(),
         )?)?;
+        // Leftover curator log rows settle here, whatever the curate mode.
+        crate::curate::settle_pending(&store, memory.root());
         let advisor = (config.memory.recall_mode() != RecallMode::Off)
             .then(|| Arc::new(Advisor::new(config, Arc::clone(&store), redactor.clone())));
         let mut omp = OmpManager::new(config.clone(), Arc::clone(&store))
@@ -122,6 +128,8 @@ impl Gateway {
         if let Some(advisor) = advisor {
             omp = omp.with_recall(advisor);
         }
+        let curator = (config.memory.curate.mode != CurateMode::Off)
+            .then(|| Curator::new(config, Arc::clone(&store), memory.clone(), redactor.clone()));
         let tools =
             onboarding::host_tools(Arc::clone(&store), config.home.clone(), omp.turn_context());
         let omp = omp.with_host_tools(tools);
@@ -133,6 +141,7 @@ impl Gateway {
             memory_exit,
             omp,
             omp_check: None,
+            curator,
         })
     }
 
@@ -167,12 +176,16 @@ impl Gateway {
             memory_exit,
             omp,
             omp_check,
+            curator,
         } = self;
         let mut inbound = adapter.start().await?;
         let mut dispatcher =
             Dispatcher::new(&config, adapter, Arc::clone(&store), omp).with_memory(memory);
         if let Some(check) = omp_check {
             dispatcher = dispatcher.with_omp_check(check);
+        }
+        if let Some(curator) = curator {
+            dispatcher = dispatcher.with_curator(curator);
         }
         let dispatcher = Arc::new(dispatcher);
         let (events, queue) = mpsc::channel(EVENT_QUEUE);
@@ -230,5 +243,148 @@ impl Gateway {
         finished.map_err(GatewayError::Task)??;
         tracing::info!("gateway stopped");
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{AccessMode, DiscordConfig, OmpConfig, Platform};
+    use crate::memory::{Bucket, NewEntry, Prov, Source};
+    use crate::store::{RecallPhase, RecallRow, RecallState};
+    use crate::testing::{Call, FakeAdapter};
+    use std::time::Duration;
+
+    const CHAN: &str = "discord:th:600";
+
+    fn config(dir: &std::path::Path) -> Config {
+        let home = dir.join("home");
+        std::fs::create_dir_all(&home).expect("home");
+        let mut memory = crate::config::MemoryConfig::default();
+        memory.curate.mode = CurateMode::On;
+        // Checked configs need at least a minute; zero makes the fresh lead idle enough.
+        memory.curate.idle_minutes = 0;
+        Config {
+            messenger: Platform::Discord,
+            work_dir: dir.to_path_buf(),
+            omp_path: dir.join("omp"),
+            home: home.clone(),
+            access_mode: AccessMode::OwnerOnly,
+            discord: Some(DiscordConfig {
+                owner_id: 111,
+                channel_id: 222,
+                token_file: home.join("token"),
+                access: Default::default(),
+            }),
+            bridge: None,
+            omp: OmpConfig::default(),
+            lead: Default::default(),
+            memory,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_due_curator_runs_once_and_tells_the_owner_about_core() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let fake = Arc::new(FakeAdapter::new());
+        let mut gateway = Gateway::open(&config(dir.path()), fake.clone()).expect("open");
+        let id = gateway
+            .memory
+            .add(NewEntry {
+                text: "리뷰는 한국어로 해 주세요".into(),
+                prov: Prov::Owner,
+                bucket: Bucket::Thread(CHAN.into()),
+                src: Source::row(3),
+                expires: None,
+                why: None,
+            })
+            .await
+            .expect("add")
+            .id;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_secs() as i64;
+        let delivered: Vec<RecallRow> = (1..=3)
+            .map(|generation| RecallRow {
+                conversation: CHAN.into(),
+                entry_id: id.clone(),
+                entry_hash: "h".into(),
+                state: RecallState::Delivered,
+                lead_generation: generation,
+                lead_epoch: 0,
+                row_id: None,
+                at: now - 1000,
+                phase: RecallPhase::Owner,
+            })
+            .collect();
+        lock(&gateway.store)
+            .record_recall(&delivered)
+            .expect("ledger");
+        let plan = format!(r#"{{"promote":["{id}"]}}"#);
+        gateway.curator = gateway.curator.map(|c| c.with_answers(vec![Ok(plan)]));
+        let store = Arc::clone(&gateway.store);
+        let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+        let run = tokio::spawn(gateway.run(async {
+            stopped.await.ok();
+        }));
+
+        let notice = |call: &Call| matches!(call, Call::Send { text, .. } if text.contains(&id));
+        tokio::time::timeout(Duration::from_secs(20), fake.wait_for_call(notice))
+            .await
+            .expect("core notice");
+        let sent: Vec<String> = fake
+            .calls()
+            .into_iter()
+            .filter_map(|call| match call {
+                Call::Send { text, .. } if text.contains(&id) => Some(text),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            sent,
+            vec![format!(
+                "기억 정리로 핵심 기억이 바뀌었어요: 핵심으로 올림 {id}. 되돌리려면 `{id} 지워`"
+            )]
+        );
+        assert!(fake.calls().contains(&Call::OpenDm {
+            user_id: "111".into()
+        }));
+        let log = lock(&store).recent_curate_log(10).expect("log");
+        assert_eq!(log.len(), 1, "{log:?}");
+        assert_eq!(
+            (log[0].op.as_str(), log[0].entry_id.as_str()),
+            ("promote", id.as_str())
+        );
+        drop(store);
+        stop.send(()).expect("stop");
+        run.await.expect("join").expect("clean stop");
+    }
+
+    #[tokio::test]
+    async fn leftover_curator_log_rows_settle_at_start_even_with_curation_off() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let mut config = config(dir.path());
+        config.memory.curate.mode = CurateMode::Off;
+        {
+            let mut store = Store::open(&config.home.join(STORE_FILE)).expect("store");
+            store
+                .log_curate_pending(&[crate::store::CurateLogRow {
+                    run_id: 1,
+                    at: 1,
+                    op: "save".into(),
+                    entry_id: "r7.s0".into(),
+                    other_id: None,
+                    bucket: format!("thread:{CHAN}"),
+                    detail: None,
+                    shadow: false,
+                }])
+                .expect("pending");
+        }
+        let gateway = Gateway::open(&config, Arc::new(FakeAdapter::new())).expect("open");
+        assert!(gateway.curator.is_none());
+        let store = lock(&gateway.store);
+        assert!(store.pending_curate_log().expect("pending").is_empty());
+        assert!(store.recent_curate_log(5).expect("log").is_empty());
     }
 }
