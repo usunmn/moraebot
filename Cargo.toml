@@ -1,6 +1,6 @@
 [package]
 name = "moraebot"
-version = "0.12.0"
+version = "0.13.0"
 edition = "2024"
 # rusqlite 0.43 needs Rust 1.89 or newer.
 rust-version = "1.89"
