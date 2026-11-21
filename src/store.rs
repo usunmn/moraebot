@@ -340,6 +340,34 @@ pub struct TurnTrace {
     pub settled: bool,
 }
 
+impl TurnTrace {
+    /// Whether the group may have read outside text: it started a tool whose source is not the
+    /// file system or a host tool (the rule `memory_write` provenance uses), started a subagent
+    /// (its tools are not traced), or used so many tools that the trace is full.
+    pub fn reads_outside(&self) -> bool {
+        self.task
+            || self.tools.len() >= MAX_TRACE_TOOLS
+            || self
+                .tools
+                .iter()
+                .any(|tool| !matches!(tool.source, ToolSource::Fs | ToolSource::Host))
+    }
+}
+
+/// Records on every row of a settled group whether its turn may have read outside text
+/// ([`TurnTrace::reads_outside`]). The column starts at 1, so a row settled without a trace
+/// (after a restart) or from before the column existed counts as having read outside text.
+fn note_reads_outside(tx: &Connection, ids: &[i64], trace: &TurnTrace) -> rusqlite::Result<()> {
+    let value = i64::from(trace.reads_outside());
+    for &id in ids {
+        tx.execute(
+            "UPDATE inbox SET reads_outside = ?2 WHERE id = ?1",
+            rusqlite::params![id, value],
+        )?;
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LogLevel {
     Info,
@@ -529,6 +557,18 @@ CREATE TABLE IF NOT EXISTS recall_ledger(
     at INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS recall_ledger_at ON recall_ledger(at);
+CREATE TABLE IF NOT EXISTS curate_log(
+    id INTEGER PRIMARY KEY,
+    run_id INTEGER NOT NULL,
+    at INTEGER NOT NULL,
+    op TEXT NOT NULL,
+    entry_id TEXT NOT NULL,
+    other_id TEXT,
+    bucket TEXT NOT NULL,
+    detail TEXT,
+    shadow INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS curate_log_entry ON curate_log(entry_id);
 ";
 
 /// Tables an older version created and nothing reads any more; `Store::open` drops them.
@@ -538,7 +578,7 @@ const DROPPED_TABLES: [&str; 3] = ["memory_notices", "memory_jobs", "memory_curs
 
 /// Columns added after slice 2 as `(table, column, declaration)`; `Store::open` adds the
 /// missing ones to an older database.
-const ADDED_COLUMNS: [(&str, &str, &str); 12] = [
+const ADDED_COLUMNS: [(&str, &str, &str); 13] = [
     ("inbox", "attachments", "TEXT"),
     ("inbox", "files_ready", "INTEGER NOT NULL DEFAULT 1"),
     ("inbox", "out_files", "TEXT"),
@@ -546,6 +586,7 @@ const ADDED_COLUMNS: [(&str, &str, &str); 12] = [
     ("inbox", "origin", "TEXT NOT NULL DEFAULT 'owner'"),
     ("inbox", "steered_into", "INTEGER"),
     ("inbox", "memory_answered", "INTEGER NOT NULL DEFAULT 0"),
+    ("inbox", "reads_outside", "INTEGER NOT NULL DEFAULT 1"),
     ("lanes", "done", "TEXT"),
     ("lanes", "repo", "TEXT"),
     ("lanes", "closed_at", "TEXT"),
@@ -1141,12 +1182,12 @@ impl Store {
 
     /// Marks every row of an interrupted group `needs_check` with `code` and, in the same
     /// transaction, holds the queued owner rows of their conversations, so the hold survives
-    /// a restart. `_trace` is the group's [`TurnTrace`]; nothing stores it now.
+    /// a restart. Every row is marked `reads_outside` when `trace` read outside text.
     pub fn interrupt_group(
         &mut self,
         ids: &[i64],
         code: &str,
-        _trace: &TurnTrace,
+        trace: &TurnTrace,
     ) -> Result<(), StoreError> {
         let tx = self
             .conn
@@ -1166,6 +1207,7 @@ impl Store {
                 [id],
             )?;
         }
+        note_reads_outside(&tx, ids, trace)?;
         tx.commit()?;
         Ok(())
     }
@@ -1200,14 +1242,14 @@ impl Store {
 
     /// Stores a turn group's reply on its main row (`reply_pending`, as
     /// [`Store::save_reply`]) and marks the steered row, if any, `done`, in one transaction.
-    /// `_trace` is the group's [`TurnTrace`]; nothing stores it now.
+    /// Every row of the group is marked `reads_outside` when `trace` read outside text.
     pub fn finish_group(
         &mut self,
         main_id: i64,
         reply: &str,
         out_files: Option<&str>,
         steered: Option<i64>,
-        _trace: &TurnTrace,
+        trace: &TurnTrace,
     ) -> Result<(), StoreError> {
         let tx = self
             .conn
@@ -1232,6 +1274,8 @@ impl Store {
                 return Err(StoreError::Invalid("no such inbox row"));
             }
         }
+        let ids: Vec<i64> = std::iter::once(main_id).chain(steered).collect();
+        note_reads_outside(&tx, &ids, trace)?;
         tx.commit()?;
         Ok(())
     }
@@ -1256,13 +1300,13 @@ impl Store {
         Ok(())
     }
 
-    /// Marks every row of a turn group `failed` with `code`, in one transaction. `_trace` is
-    /// the group's [`TurnTrace`]; nothing stores it now.
+    /// Marks every row of a turn group `failed` with `code`, in one transaction, each also
+    /// `reads_outside` when `trace` read outside text.
     pub fn fail_group(
         &mut self,
         ids: &[i64],
         code: &str,
-        _trace: &TurnTrace,
+        trace: &TurnTrace,
     ) -> Result<(), StoreError> {
         let tx = self
             .conn
@@ -1278,6 +1322,7 @@ impl Store {
                 return Err(StoreError::Invalid("no such inbox row"));
             }
         }
+        note_reads_outside(&tx, ids, trace)?;
         tx.commit()?;
         Ok(())
     }
@@ -1792,6 +1837,337 @@ impl Store {
             )
             .optional()?)
     }
+
+    /// The curator's counters ([`crate::curate`]).
+    pub fn curate_state(&self) -> Result<CurateState, StoreError> {
+        Ok(CurateState {
+            cursor: self.counter(CURATE_CURSOR)?.unwrap_or(0),
+            last_run: self.counter(CURATE_LAST_RUN)?,
+            failures: self.counter(CURATE_FAILURES)?.unwrap_or(0),
+        })
+    }
+
+    /// The id of a new curator run: one more than the last, never repeated.
+    pub fn next_curate_run(&self) -> Result<i64, StoreError> {
+        Ok(self.conn.query_row(
+            "INSERT INTO counters(name, value) VALUES (?1, 1)
+             ON CONFLICT(name) DO UPDATE SET value = value + 1
+             RETURNING value",
+            [CURATE_RUN],
+            |r| r.get(0),
+        )?)
+    }
+
+    /// The curator's window: at most `limit` finished owner messages from `owner` after row
+    /// `after`, oldest first, that were not answered by moraebot itself (`memory_answered`).
+    /// It stops before the first owner row still queued or running, so the cursor never
+    /// passes a row whose turn has not ended.
+    pub fn curate_window(
+        &self,
+        owner: &str,
+        after: i64,
+        limit: usize,
+    ) -> Result<Vec<CurateRow>, StoreError> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {CURATE_COLS} FROM inbox
+             WHERE {CURATE_WHERE} AND id > ?2
+               AND id < COALESCE((SELECT MIN(id) FROM inbox
+                                  WHERE id > ?2 AND origin = 'owner'
+                                    AND state IN ('queued', 'processing')), 9223372036854775807)
+             ORDER BY id LIMIT ?3"
+        ))?;
+        let rows = stmt.query_map(
+            params![owner, after, i64::try_from(limit).unwrap_or(i64::MAX)],
+            map_curate_row,
+        )?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// At most `limit` finished owner messages from `owner` at or before row `upto`, newest
+    /// first (the curator's evidence for a promotion).
+    pub fn owner_rows_upto(
+        &self,
+        owner: &str,
+        upto: i64,
+        limit: usize,
+    ) -> Result<Vec<CurateRow>, StoreError> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {CURATE_COLS} FROM inbox WHERE {CURATE_WHERE} AND id <= ?2
+             ORDER BY id DESC LIMIT ?3"
+        ))?;
+        let rows = stmt.query_map(
+            params![owner, upto, i64::try_from(limit).unwrap_or(i64::MAX)],
+            map_curate_row,
+        )?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// How many different lead generations the recall advisor delivered entry `entry_id` to
+    /// at or after `since` (unix seconds).
+    pub fn delivered_generations(&self, entry_id: &str, since: i64) -> Result<i64, StoreError> {
+        Ok(self.conn.query_row(
+            "SELECT COUNT(DISTINCT lead_generation) FROM recall_ledger
+             WHERE entry_id = ?1 AND state = 'delivered' AND at >= ?2",
+            params![entry_id, since],
+            |r| r.get(0),
+        )?)
+    }
+
+    /// The newest applied (not shadow) curator log row with `op` for `entry_id`.
+    pub fn curate_logged(
+        &self,
+        op: &str,
+        entry_id: &str,
+    ) -> Result<Option<CurateLogRow>, StoreError> {
+        Ok(self
+            .conn
+            .query_row(
+                &format!(
+                    "SELECT {CURATE_LOG_COLS} FROM curate_log
+                     WHERE op = ?1 AND entry_id = ?2 AND shadow = 0
+                     ORDER BY id DESC LIMIT 1"
+                ),
+                params![op, entry_id],
+                map_curate_log,
+            )
+            .optional()?)
+    }
+
+    /// Applied curator changes of the core file (promotions and demotions) at or after
+    /// `since` (unix seconds).
+    pub fn curate_core_changes_since(&self, since: i64) -> Result<i64, StoreError> {
+        Ok(self.conn.query_row(
+            "SELECT COUNT(*) FROM curate_log
+             WHERE op IN ('promote', 'demote') AND shadow = 0 AND at >= ?1",
+            [since],
+            |r| r.get(0),
+        )?)
+    }
+
+    /// Ends a curator run in one transaction: writes `rows`, moves the cursor to `cursor`
+    /// (when given), records `now` as the last run and `failures` as the failures of the
+    /// current window, and counts the run as failed when `failed`.
+    pub fn finish_curate_run(
+        &mut self,
+        rows: &[CurateLogRow],
+        cursor: Option<i64>,
+        now: i64,
+        failures: i64,
+        failed: bool,
+    ) -> Result<(), StoreError> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        for row in rows {
+            tx.execute(
+                "INSERT INTO curate_log(run_id, at, op, entry_id, other_id, bucket, detail, shadow)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![
+                    row.run_id,
+                    row.at,
+                    row.op,
+                    row.entry_id,
+                    row.other_id,
+                    row.bucket,
+                    row.detail,
+                    row.shadow
+                ],
+            )?;
+        }
+        let set = "INSERT INTO counters(name, value) VALUES (?1, ?2)
+                   ON CONFLICT(name) DO UPDATE SET value = excluded.value";
+        if let Some(cursor) = cursor {
+            tx.execute(set, params![CURATE_CURSOR, cursor])?;
+        }
+        tx.execute(set, params![CURATE_LAST_RUN, now])?;
+        tx.execute(set, params![CURATE_FAILURES, failures])?;
+        if failed {
+            tx.execute(
+                "INSERT INTO counters(name, value) VALUES (?1, 1)
+                 ON CONFLICT(name) DO UPDATE SET value = value + 1",
+                [CURATE_FAILED_RUNS],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// The newest `limit` curator log rows, newest first (the owner's "recent cleanup").
+    pub fn recent_curate_log(&self, limit: usize) -> Result<Vec<CurateLogRow>, StoreError> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {CURATE_LOG_COLS} FROM curate_log ORDER BY id DESC LIMIT ?1"
+        ))?;
+        let rows = stmt.query_map([i64::try_from(limit).unwrap_or(i64::MAX)], map_curate_log)?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// The curator's state for the status answer.
+    pub fn curate_status(&self) -> Result<CurateStatus, StoreError> {
+        let state = self.curate_state()?;
+        let last_run_id = self.counter(CURATE_RUN)?;
+        let rows: Vec<CurateLogRow> = match last_run_id {
+            Some(run) => {
+                let mut stmt = self.conn.prepare(&format!(
+                    "SELECT {CURATE_LOG_COLS} FROM curate_log WHERE run_id = ?1 ORDER BY id"
+                ))?;
+                stmt.query_map([run], map_curate_log)?
+                    .collect::<Result<_, _>>()?
+            }
+            None => Vec::new(),
+        };
+        let mut counts: Vec<(String, i64)> = Vec::new();
+        for row in &rows {
+            match counts.iter_mut().find(|(op, _)| *op == row.op) {
+                Some((_, n)) => *n += 1,
+                None => counts.push((row.op.clone(), 1)),
+            }
+        }
+        let open_conflicts = rows
+            .iter()
+            .filter(|row| row.op == "conflict")
+            .map(|row| {
+                (
+                    row.entry_id.clone(),
+                    row.other_id.clone().unwrap_or_default(),
+                )
+            })
+            .collect();
+        Ok(CurateStatus {
+            last_run_at: state.last_run,
+            last_run_id,
+            last_counts: counts,
+            last_shadow: rows.iter().any(|row| row.shadow),
+            open_conflicts,
+            window_failures: state.failures,
+            failed_runs: self.counter(CURATE_FAILED_RUNS)?.unwrap_or(0),
+        })
+    }
+
+    /// The counter `name`, `None` when it was never set.
+    fn counter(&self, name: &str) -> Result<Option<i64>, StoreError> {
+        Ok(self
+            .conn
+            .query_row("SELECT value FROM counters WHERE name = ?1", [name], |r| {
+                r.get(0)
+            })
+            .optional()?)
+    }
+
+    /// Sets the time row `id` was received (tests date rows to other days).
+    #[cfg(test)]
+    pub(crate) fn set_received_at(&self, id: i64, at: &str) -> Result<(), StoreError> {
+        self.conn.execute(
+            "UPDATE inbox SET received_at = ?2 WHERE id = ?1",
+            params![id, at],
+        )?;
+        Ok(())
+    }
+}
+
+/// Counter: the last inbox row the curator has looked at.
+const CURATE_CURSOR: &str = "curate_cursor";
+/// Counter: when the last curator run ended (unix seconds).
+const CURATE_LAST_RUN: &str = "curate_last_run";
+/// Counter: failed curator runs on the current window.
+const CURATE_FAILURES: &str = "curate_failures";
+/// Counter: every failed curator run.
+const CURATE_FAILED_RUNS: &str = "curate_failed_runs";
+/// Counter: the last curator run id.
+const CURATE_RUN: &str = "curate_run";
+
+const CURATE_COLS: &str =
+    "id, conversation_key, text, reply, received_at, reads_outside, steered_into";
+
+/// Finished owner messages from the owner (`?1`) that moraebot did not answer itself.
+const CURATE_WHERE: &str = "origin = 'owner' AND author_id = ?1 AND memory_answered = 0
+     AND state IN ('done', 'reply_pending')";
+
+const CURATE_LOG_COLS: &str = "run_id, at, op, entry_id, other_id, bucket, detail, shadow";
+
+fn map_curate_row(r: &SqlRow<'_>) -> rusqlite::Result<CurateRow> {
+    Ok(CurateRow {
+        id: r.get(0)?,
+        conversation_key: r.get(1)?,
+        text: r.get(2)?,
+        reply: r.get(3)?,
+        received_at: r.get(4)?,
+        reads_outside: r.get::<_, i64>(5)? != 0,
+        steered_into: r.get(6)?,
+    })
+}
+
+fn map_curate_log(r: &SqlRow<'_>) -> rusqlite::Result<CurateLogRow> {
+    Ok(CurateLogRow {
+        run_id: r.get(0)?,
+        at: r.get(1)?,
+        op: r.get(2)?,
+        entry_id: r.get(3)?,
+        other_id: r.get(4)?,
+        bucket: r.get(5)?,
+        detail: r.get(6)?,
+        shadow: r.get::<_, i64>(7)? != 0,
+    })
+}
+
+/// The curator's counters ([`Store::curate_state`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CurateState {
+    /// The last inbox row looked at (0 before the first run).
+    pub cursor: i64,
+    /// When the last run ended (unix seconds).
+    pub last_run: Option<i64>,
+    /// Failed runs on the current window.
+    pub failures: i64,
+}
+
+/// One owner message the curator reads ([`Store::curate_window`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CurateRow {
+    pub id: i64,
+    pub conversation_key: String,
+    pub text: String,
+    /// The lead's reply of the turn.
+    pub reply: Option<String>,
+    /// `YYYY-MM-DDTHH:MM:SS.sssZ`.
+    pub received_at: String,
+    /// The turn read text from outside the owner's messages (web pages, files, lane results).
+    pub reads_outside: bool,
+    /// The main row whose lead turn this row was steered into.
+    pub steered_into: Option<i64>,
+}
+
+/// One `curate_log` row: a change the curator made (or, `shadow`, would have made), a
+/// conflict it found, or a window it skipped. `at` is unix seconds; `bucket` a
+/// [`crate::memory::Bucket::label`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CurateLogRow {
+    pub run_id: i64,
+    pub at: i64,
+    /// `save`, `replace`, `conflict`, `promote`, `demote`, `unsave`, `forget` or `skipped`.
+    pub op: String,
+    pub entry_id: String,
+    pub other_id: Option<String>,
+    pub bucket: String,
+    pub detail: Option<String>,
+    pub shadow: bool,
+}
+
+/// The curator's state for the status answer ([`Store::curate_status`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CurateStatus {
+    /// When the last run ended (unix seconds).
+    pub last_run_at: Option<i64>,
+    pub last_run_id: Option<i64>,
+    /// Log rows of the last run per op, in first-seen order.
+    pub last_counts: Vec<(String, i64)>,
+    /// The last run only logged (shadow mode).
+    pub last_shadow: bool,
+    /// The conflicts the last run found, as `(a, b)` entry ids.
+    pub open_conflicts: Vec<(String, String)>,
+    /// Failed runs on the current window.
+    pub window_failures: i64,
+    /// Every failed run.
+    pub failed_runs: i64,
 }
 
 #[cfg(test)]
@@ -2870,6 +3246,56 @@ mod tests {
     }
 
     #[test]
+    fn settled_groups_record_whether_the_turn_read_outside_text() {
+        let (_d, _p, mut s) = open_tmp();
+        let reads_outside = |s: &Store, id: i64| -> bool {
+            s.conn
+                .query_row("SELECT reads_outside FROM inbox WHERE id = ?1", [id], |r| {
+                    r.get(0)
+                })
+                .unwrap()
+        };
+        let trace = |sources: &[ToolSource]| TurnTrace {
+            tools: sources
+                .iter()
+                .map(|&source| ToolUse::new("tool", source))
+                .collect(),
+            ..TurnTrace::default()
+        };
+        let local = trace(&[ToolSource::Fs, ToolSource::Host]);
+
+        let m = claimed(&mut s, "m1", K1);
+        let st = new_id(admit(&mut s, "m2", K1));
+        assert!(s.steer_into(st, m).unwrap());
+        s.finish_group(
+            m,
+            "r",
+            None,
+            Some(st),
+            &trace(&[ToolSource::Fs, ToolSource::Web]),
+        )
+        .unwrap();
+        assert!(reads_outside(&s, m) && reads_outside(&s, st));
+
+        let quiet = claimed(&mut s, "m3", K2);
+        s.finish_group(quiet, "r", None, None, &local).unwrap();
+        assert!(!reads_outside(&s, quiet));
+
+        let failed = claimed(&mut s, "m4", K2);
+        s.fail_group(&[failed], "E_TEST", &trace(&[ToolSource::Shell]))
+            .unwrap();
+        assert!(reads_outside(&s, failed));
+        let failed_quiet = claimed(&mut s, "m5", K2);
+        s.fail_group(&[failed_quiet], "E_TEST", &local).unwrap();
+        assert!(!reads_outside(&s, failed_quiet));
+
+        let cut = claimed(&mut s, "m6", K2);
+        s.interrupt_group(&[cut], "E_TEST", &trace(&[ToolSource::Github]))
+            .unwrap();
+        assert!(reads_outside(&s, cut));
+    }
+
+    #[test]
     fn interrupt_group_holds_queued_rows_of_each_conversation() {
         let (_d, _p, mut s) = open_tmp();
         let m = claimed(&mut s, "m1", K1);
@@ -3466,6 +3892,27 @@ mod tests {
             s.get(id).unwrap().unwrap().reply.as_deref(),
             Some("the reply")
         );
+    }
+
+    #[test]
+    fn the_curate_window_stops_before_a_turn_still_running() {
+        let (_d, _p, mut s) = open_tmp();
+        let done = new_id(s.admit("test", "a", "k", "c", "111", "one").unwrap());
+        let running = new_id(s.admit("test", "b", "k", "c", "111", "two").unwrap());
+        let after = new_id(s.admit("test", "c", "k", "c", "111", "three").unwrap());
+        let stranger = new_id(s.admit("test", "d", "k", "c", "222", "four").unwrap());
+        for id in [done, after, stranger] {
+            s.mark(id, State::Done, None).unwrap();
+        }
+        s.mark(running, State::Processing, None).unwrap();
+        let ids = |rows: Vec<CurateRow>| rows.into_iter().map(|r| r.id).collect::<Vec<_>>();
+        assert_eq!(ids(s.curate_window("111", 0, 10).unwrap()), vec![done]);
+        s.mark(running, State::Done, None).unwrap();
+        assert_eq!(
+            ids(s.curate_window("111", 0, 10).unwrap()),
+            vec![done, running, after]
+        );
+        assert_eq!(ids(s.curate_window("111", done, 1).unwrap()), vec![running]);
     }
 
     #[test]
