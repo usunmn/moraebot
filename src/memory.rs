@@ -86,6 +86,8 @@ pub const E_MEMORY_BUCKET: &str = "E_MEMORY_BUCKET";
 pub const E_MEMORY_PROVENANCE: &str = "E_MEMORY_PROVENANCE";
 /// The memory worker has stopped.
 pub const E_MEMORY_STOPPED: &str = "E_MEMORY_STOPPED";
+/// A move into the core would make the lead's core block leave entries out.
+pub const E_MEMORY_CORE_FULL: &str = "E_MEMORY_CORE_FULL";
 /// A new entry was written (logged with its id, file and bucket, never its text). Saves are
 /// internal: moraebot never posts them in a conversation; the owner lists them on request.
 pub const I_MEMORY_SAVED: &str = "I_MEMORY_SAVED";
@@ -2448,6 +2450,36 @@ impl MemoryStore {
         })
     }
 
+    /// Refuses with [`E_MEMORY_CORE_FULL`] when `owner` as the new `core/owner.md` (as written
+    /// in this batch, with the boundaries as they are now) would not fit the core block the
+    /// lead renders ([`crate::omp::core_block_cap`]) with nothing left out. Checked where a
+    /// move into the core is applied, whoever planned it.
+    fn check_core_fits(&mut self, owner: &MemFile, today: Day) -> Result<(), MemoryError> {
+        let boundaries = self
+            .read_own(&Bucket::Boundaries.rel_path())?
+            .map(|file| file.entries)
+            .unwrap_or_default();
+        let lines: Vec<(usize, usize, Entry)> = [(0, &owner.entries), (1, &boundaries)]
+            .into_iter()
+            .flat_map(|(file, entries)| {
+                entries
+                    .iter()
+                    .filter(|e| e.prov == Prov::Owner && !e.expired(today))
+                    .enumerate()
+                    .map(move |(pos, e)| (file, pos, e.clone()))
+            })
+            .collect();
+        let cap = crate::omp::core_block_cap();
+        let size = render_core(&lines, 0).len();
+        if size > cap {
+            return Err(MemoryError::new(
+                E_MEMORY_CORE_FULL,
+                format!("the core block would be {size} bytes, over {cap}"),
+            ));
+        }
+        Ok(())
+    }
+
     /// Moves the live entry `id` from `from` to `to`, a project or conversation file and
     /// `core/owner.md` (one each way); the entry keeps every field.
     fn relocate(
@@ -2482,6 +2514,9 @@ impl MemoryStore {
         target.entries.retain(|e| e.id != id);
         target.entries.push(entry.clone());
         target.entries.sort_by_key(|e| e.day);
+        if *to == Bucket::Owner {
+            self.check_core_fits(&target, today)?;
+        }
         source.updated = today;
         target.updated = today;
         // The target first: a crash in between leaves a copy, never a loss.
@@ -5576,5 +5611,45 @@ mod tests {
                 .replace("repositoryformatversion = 0", "repositoryformatversion = 1")
                 + "[extensions]\n\tnoop = true\n"
         );
+    }
+
+    /// moraedang on #78: the core cap holds where a promotion is applied, whoever planned it.
+    #[test]
+    fn a_promotion_that_would_overflow_the_core_block_is_refused_when_applied() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut store, _) = open(dir.path(), "2026-11-21");
+        let cap = crate::omp::core_block_cap();
+        let mut row = 1;
+        while render_core(&core_lines(store.root(), day("2026-11-21")), 0).len() + 700 < cap {
+            store
+                .add(owner(
+                    &format!("rule {row} {}", "a".repeat(600)),
+                    Bucket::Owner,
+                    row,
+                ))
+                .expect("core rule");
+            row += 1;
+        }
+        let big = store
+            .add(owner(&"b".repeat(1500), Bucket::Thread("k".into()), 900))
+            .expect("thread entry");
+        let small = store
+            .add(owner("short", Bucket::Thread("k".into()), 901))
+            .expect("thread entry");
+        let results = store.apply(vec![
+            Op::Promote { id: big.id.clone() },
+            Op::Promote {
+                id: small.id.clone(),
+            },
+        ]);
+        assert!(
+            matches!(&results[0], Err(e) if e.code == E_MEMORY_CORE_FULL),
+            "{results:?}"
+        );
+        assert!(matches!(&results[1], Ok(Outcome::Moved(_))), "{results:?}");
+        let found = find(store.root(), &big.id).expect("find").expect("entry");
+        assert_eq!(found.bucket, Bucket::Thread("k".into()));
+        let found = find(store.root(), &small.id).expect("find").expect("entry");
+        assert_eq!(found.bucket, Bucket::Owner);
     }
 }
