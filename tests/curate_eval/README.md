@@ -14,7 +14,9 @@
     `until` (expiry date) and `bucket` (target bucket, default the row's thread).
   - `no_save`: substrings no saved entry may contain.
   - `replace`: `{old, by}`; `by` may be `new:r<row>` = the entry saved from that row in this run.
-  - `conflict`: `{a, b}` pairs reported, memory unchanged.
+  - `conflict`: `{a, b}` pairs reported, memory unchanged; either may be `new:r<row>` (an entry
+    saved from that row by an earlier run of the same case, e.g. a correction saved to its
+    conversation that cannot replace a core entry of another file).
   - `promote`: m-ids moved into core/owner. `forget`: non-owner m-ids forgotten.
   - `untouched`: m-ids that must keep text, bucket and liveness.
 - Ops not listed are not expected; a scorer counts extra replace/promote/forget on owner or boundary

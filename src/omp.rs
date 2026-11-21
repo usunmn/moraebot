@@ -1158,6 +1158,8 @@ struct LeadWatch {
     reported: bool,
     /// The running turn already got its busy note.
     busy_noted: bool,
+    /// When the last lead turn ended; `None` before the first.
+    ended: Option<Instant>,
 }
 
 /// What the lead is doing now, for a status answer ([`OmpManager::lead_status`]).
@@ -1183,6 +1185,7 @@ impl LeadWatch {
 
     fn end(&mut self) {
         self.key = None;
+        self.ended = Some(Instant::now());
         self.began = None;
         self.tool = None;
         self.seen = None;
@@ -1302,6 +1305,8 @@ pub struct OmpManager {
     /// Token usage and restarts of the lead.
     metrics: Arc<Mutex<LeadMetrics>>,
     lead_watch: Arc<Mutex<LeadWatch>>,
+    /// When this manager was made: the lead counts as idle since then until its first turn.
+    created: Instant,
     /// The last attempt to start the lead child failed and none has succeeded since.
     lead_down: AtomicBool,
     /// The lead's tool call starts its event drain handled, for `memory_write`.
@@ -1361,6 +1366,7 @@ impl OmpManager {
             store,
             turn_timeout,
             lead_watch: Default::default(),
+            created: Instant::now(),
             tool_starts: Default::default(),
             extra_env: Vec::new(),
             hints: String::new(),
@@ -1521,6 +1527,16 @@ impl OmpManager {
     /// a row queued for the lead would then only fail.
     pub fn lead_down(&self) -> bool {
         self.lead_down.load(Ordering::Relaxed)
+    }
+
+    /// How long ago the last lead turn ended (since this manager was made when no lead turn
+    /// ran yet); `None` while a lead turn runs.
+    pub fn lead_idle(&self) -> Option<Duration> {
+        let watch = lock(&self.lead_watch);
+        if watch.began.is_some() {
+            return None;
+        }
+        Some(watch.ended.unwrap_or(self.created).elapsed())
     }
 
     /// What the running lead turn is doing at `now`, its tool intent cleaned by
@@ -2847,6 +2863,18 @@ mod tests {
         let base = Instant::now();
         assert_eq!(manager.lead_stalled(base), None);
         assert_eq!(manager.lead_stalled(base + 2 * AFTER), None);
+    }
+
+    #[test]
+    fn lead_idle_counts_from_the_start_then_from_the_last_turn_end() {
+        let (_dir, manager) = manager_with(None);
+        assert!(manager.lead_idle().is_some(), "idle before any turn");
+        lock(&manager.lead_watch).begin("discord:th:1", Instant::now());
+        assert_eq!(manager.lead_idle(), None, "a turn runs");
+        std::thread::sleep(Duration::from_millis(5));
+        lock(&manager.lead_watch).end();
+        let since_end = manager.lead_idle().expect("idle after the turn");
+        assert!(since_end < manager.created.elapsed(), "{since_end:?}");
     }
 
     fn qa_day(text: &str) -> memory::Day {

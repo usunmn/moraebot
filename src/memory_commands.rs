@@ -24,6 +24,9 @@
 //! - recent recalls: the whole message `최근 떠올린 기억` / `recent recalls`
 //!   ([`recent_recalls_request`]) lists the last [`RECENT_RECALLS`] recall ledger rows with
 //!   each entry's current text.
+//! - recent cleanup: the whole message `최근 정리` / `recent cleanup`
+//!   ([`recent_cleanup_request`]) lists the last [`RECENT_CLEANUP`] memory curator changes
+//!   ([`crate::curate`]) with each entry's current text and how to undo the change.
 //!
 //! A question (`... 기억해?`) is not a remember request, and id commands must be short (at
 //! most [`MAX_ID_COMMAND_WORDS`] words) so a sentence that merely mentions an id and a verb
@@ -315,6 +318,133 @@ pub fn recent_recalls(
             crate::status::ago(lang, now - row.at),
             row.entry_id
         ));
+    }
+    out.join("\n")
+}
+
+/// How many curator log rows the recent-cleanup answer lists.
+pub const RECENT_CLEANUP: usize = 20;
+
+/// The owner's recent-cleanup command: the whole message is `최근 정리` or `recent cleanup`
+/// (normalized like [`refresh_request`]). Returns the language it was given in.
+pub fn recent_cleanup_request(text: &str) -> Option<crate::status::Lang> {
+    match normalize(text).as_str() {
+        "최근 정리" => Some(crate::status::Lang::Korean),
+        "recent cleanup" => Some(crate::status::Lang::English),
+        _ => None,
+    }
+}
+
+/// The owner command that undoes a curator change to `id`, if there is one: a replaced or
+/// forgotten entry is restored, a saved or promoted one forgotten.
+pub fn curate_undo(lang: crate::status::Lang, op: &str, id: &str) -> Option<String> {
+    use crate::status::Lang;
+    match (op, lang) {
+        ("replace" | "forget" | "unsave", Lang::Korean) => Some(format!("{id} 되살려")),
+        ("replace" | "forget" | "unsave", Lang::English) => Some(format!("restore {id}")),
+        ("save" | "promote", Lang::Korean) => Some(format!("{id} 지워")),
+        ("save" | "promote", Lang::English) => Some(format!("forget {id}")),
+        _ => None,
+    }
+}
+
+/// The answer to the recent-cleanup command: one line per curator log row of `rows` (newest
+/// first) with its age at `now` (unix seconds), the change, the entry ids and the entry's
+/// current text, or `(gone)` when it is archived or removed, then how to undo it. A conflict
+/// whose two entries are both still live gets the forget and correct hint; one already
+/// settled says so.
+pub fn recent_cleanup(
+    memory: &MemoryHandle,
+    lang: crate::status::Lang,
+    rows: &[crate::store::CurateLogRow],
+    now: i64,
+) -> String {
+    use crate::status::Lang;
+    if rows.is_empty() {
+        return match lang {
+            Lang::Korean => "아직 정리한 기억이 없어요.".into(),
+            Lang::English => "No memory cleanup yet.".into(),
+        };
+    }
+    let live = |id: &str| -> Option<String> {
+        match memory.show(id) {
+            Ok(Some(found)) if !found.archived => Some(found.entry.text),
+            _ => None,
+        }
+    };
+    let gone = match lang {
+        Lang::Korean => "(없어짐)",
+        Lang::English => "(gone)",
+    };
+    let mut out = vec![match lang {
+        Lang::Korean => format!("최근 기억 정리 {}건 (최신순):", rows.len()),
+        Lang::English => format!("Last {} memory cleanup changes, newest first:", rows.len()),
+    }];
+    for row in rows {
+        let op = match (lang, row.op.as_str()) {
+            (Lang::Korean, "save") => "저장",
+            (Lang::Korean, "replace") => "교체",
+            (Lang::Korean, "conflict") => "충돌",
+            (Lang::Korean, "promote") => "핵심으로 올림",
+            (Lang::Korean, "demote") => "핵심에서 내림",
+            (Lang::Korean, "unsave") => "저장 취소",
+            (Lang::Korean, "forget") => "지움",
+            (Lang::Korean, "skipped") => "건너뜀",
+            (Lang::English, "save") => "saved",
+            (Lang::English, "replace") => "replaced",
+            (Lang::English, "conflict") => "conflict",
+            (Lang::English, "promote") => "promoted to core",
+            (Lang::English, "demote") => "moved out of core",
+            (Lang::English, "unsave") => "unsaved",
+            (Lang::English, "forget") => "forgot",
+            (Lang::English, "skipped") => "skipped",
+            (_, other) => other,
+        };
+        let ids = match &row.other_id {
+            Some(other) if row.op == "replace" => format!("{} -> {other}", row.entry_id),
+            Some(other) => format!("{} / {other}", row.entry_id),
+            None => row.entry_id.clone(),
+        };
+        let mut line = format!("- {} {op} {ids}", crate::status::ago(lang, now - row.at));
+        if row.shadow {
+            line.push_str(match lang {
+                Lang::Korean => " (기록만)",
+                Lang::English => " (shadow)",
+            });
+        }
+        if row.op == "skipped" {
+            out.push(line);
+            continue;
+        }
+        let text = live(&row.entry_id);
+        line.push_str(": ");
+        line.push_str(text.as_deref().unwrap_or(gone));
+        if row.op == "conflict" {
+            let other = row.other_id.as_deref().unwrap_or_default();
+            let open = text.is_some() && live(other).is_some();
+            line.push_str(&match (lang, open) {
+                (Lang::Korean, true) => format!(
+                    " / {other}: {} (틀린 쪽을 지우거나 고쳐 주세요: `{a} 지워`, `{a} 고쳐: 새 내용`)",
+                    live(other).unwrap_or_default(),
+                    a = row.entry_id
+                ),
+                (Lang::English, true) => format!(
+                    " / {other}: {} (forget or correct the wrong one: `forget {a}`, `correct {a}: new text`)",
+                    live(other).unwrap_or_default(),
+                    a = row.entry_id
+                ),
+                (Lang::Korean, false) => " (정리됨)".to_owned(),
+                (Lang::English, false) => " (settled)".to_owned(),
+            });
+        } else if !row.shadow
+            && let Some(undo) = curate_undo(lang, &row.op, &row.entry_id)
+        {
+            line.push_str(&match lang {
+                Lang::Korean => format!(" (되돌리기: `{undo}`)"),
+                Lang::English => format!(" (undo: `{undo}`)"),
+            });
+        }
+        out.push(line);
     }
     out.join("\n")
 }
@@ -1027,6 +1157,119 @@ mod tests {
             text.contains("작업 중 기록만 m-abcdef (없어짐)")
                 && text.contains("오너 메시지 전달됨"),
             "{text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn recent_cleanup_lists_log_rows_with_text_undo_and_open_conflicts() {
+        use crate::status::Lang;
+        use crate::store::{CurateLogRow, Store};
+
+        assert_eq!(
+            recent_cleanup_request("Recent cleanup?"),
+            Some(Lang::English)
+        );
+        assert_eq!(recent_cleanup_request("최근 정리"), Some(Lang::Korean));
+        assert_eq!(recent_cleanup_request("show the recent cleanup"), None);
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let today = Day::from_ymd(2026, 11, 22).expect("day");
+        let store = MemoryStore::open(
+            &dir.path().join("memory"),
+            Redactor::default(),
+            Arc::new(move || today),
+        )
+        .expect("open");
+        let memory = MemoryHandle::spawn(store).expect("spawn");
+        let add = |text: &'static str, row: i64| {
+            let memory = memory.clone();
+            async move {
+                memory
+                    .add(NewEntry {
+                        text: text.into(),
+                        prov: Prov::Owner,
+                        bucket: Bucket::General,
+                        src: Source::row(row),
+                        expires: None,
+                        why: None,
+                    })
+                    .await
+                    .expect("add")
+                    .id
+            }
+        };
+        let saved = add("deploys go through make release", 3).await;
+        let a = add("reviews are in Korean", 4).await;
+        let b = add("reviews are in English", 5).await;
+        let old = add("lunch is noodles", 6).await;
+        memory.forget(&old).await.expect("forget");
+        let mut log = Store::open(&dir.path().join("inbox.sqlite")).expect("store");
+        let row = |op: &str, id: &str, other: Option<&str>, at| CurateLogRow {
+            run_id: 1,
+            at,
+            op: op.into(),
+            entry_id: id.into(),
+            other_id: other.map(Into::into),
+            bucket: "general".into(),
+            detail: None,
+            shadow: false,
+        };
+        log.finish_curate_run(
+            &[
+                row("save", &saved, None, 1000),
+                row("replace", &old, Some(&saved), 1000),
+                row("conflict", &a, Some(&b), 1000),
+                row("conflict", &a, Some(&old), 1000),
+            ],
+            None,
+            1000,
+            0,
+            false,
+        )
+        .expect("log");
+        let rows = log.recent_curate_log(RECENT_CLEANUP).expect("rows");
+        let text = recent_cleanup(&memory, Lang::English, &rows, 1000 + 2 * 3600);
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines[0], "Last 4 memory cleanup changes, newest first:");
+        assert_eq!(
+            lines[1],
+            format!("- 2 h ago conflict {a} / {old}: reviews are in Korean (settled)")
+        );
+        assert_eq!(
+            lines[2],
+            format!(
+                "- 2 h ago conflict {a} / {b}: reviews are in Korean / {b}: reviews are in English \
+                 (forget or correct the wrong one: `forget {a}`, `correct {a}: new text`)"
+            )
+        );
+        assert_eq!(
+            lines[3],
+            format!("- 2 h ago replaced {old} -> {saved}: (gone) (undo: `restore {old}`)")
+        );
+        assert_eq!(
+            lines[4],
+            format!(
+                "- 2 h ago saved {saved}: deploys go through make release (undo: `forget {saved}`)"
+            )
+        );
+        let korean = recent_cleanup(&memory, Lang::Korean, &rows, 1000 + 2 * 3600);
+        assert!(
+            korean.starts_with("최근 기억 정리 4건 (최신순):"),
+            "{korean}"
+        );
+        assert!(
+            korean.contains(&format!(
+                "교체 {old} -> {saved}: (없어짐) (되돌리기: `{old} 되살려`)"
+            )),
+            "{korean}"
+        );
+        assert!(
+            korean.contains(&format!("`{a} 지워`, `{a} 고쳐: 새 내용`")),
+            "{korean}"
+        );
+        assert_eq!(
+            recent_cleanup(&memory, Lang::English, &[], 0),
+            "No memory cleanup yet."
         );
     }
 }

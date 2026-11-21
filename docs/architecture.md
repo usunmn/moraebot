@@ -482,6 +482,16 @@ This subsection is in English (#39 P2); docs/memory.md has the owner-facing deta
 
 **Old config.** A `[memory.jev]` table (any keys) still loads: `MemoryConfig.ignored` names it, the gateway logs `W_CONFIG_IGNORED`, and `check-config` prints an advisory `WARN memory` line. `to_toml` never writes it back.
 
+### 3.10b 기억 정리(curator)
+
+`src/curate.rs`의 `Curator`가 주인이 명령하지 않아도 저장된 기억을 정리합니다. 주인용 설명, 규칙, 설정은 docs/memory.md#memory-tidy-curator에 있습니다.
+
+- **언제.** `[memory.curate] mode`가 `off`가 아니면 `Gateway::open`이 `Curator`를 만들고 `Dispatcher::with_curator`로 넘깁니다. `Dispatcher::run`은 다른 백그라운드 작업처럼 `memory curator` 작업을 띄우고, 끌 때 함께 멈춥니다. 이 작업은 `CURATE_TICK`(60초)마다 `Curator::due(OmpManager::lead_idle(), now)`를 묻고, 맞으면 `run_once`를 끝까지 기다립니다. 그래서 두 번이 겹치지 않습니다.
+- **`lead_idle`.** 마지막 lead 턴이 끝난 뒤 지난 시간입니다. 턴이 도는 동안은 `None`, 이 프로세스에서 lead 턴이 아직 없으면 `OmpManager`를 만든 뒤 지난 시간입니다.
+- **한 번 실행.** 도구 없는 잠긴 omp 호출(`Summarizer`) 최대 두 번(주인 패스, 참고 패스)으로 계획을 받고, 코드가 각 작업을 스냅샷과 앞선 작업의 결과에 맞춰 검사한 뒤 통과한 것만 메모리 배치 하나로 적용합니다. `shadow`면 기록만 합니다. 결과는 `curate_log` 표와 `curate_*` 카운터에 남습니다.
+- **주인에게 보이는 것.** `최근 정리` / `recent cleanup`(`memory_commands::recent_cleanup`, 최근 20줄), 상태 답의 한 줄(`status::curate_line`), 적용된 작업이 core를 바꾸면 주인 DM 한 줄(`dispatch::curate_core_notice`, 바뀐 id와 되돌리는 명령). DM을 열 수 없으면 보내지 않습니다.
+- **lead에게.** `CORE_HEADER`는 core에 주인이 여러 번 한 말을 moraebot이 옮겨 둔 것도 있다고 말합니다. 기본 안내문은 moraebot이 쉬는 동안 기억을 정리한다는 것과, 주인이 기억을 고치면 그 문장을 `memory_write`로 저장하라고 알려 줍니다.
+
 ### 3.11 레인 작업 폴더 (lanes L1)
 
 **언제 쓰나.** `lane_start`는 선택 인자 `repo`(git 저장소 경로)를 받습니다. 없거나 `null`이면 lane은 지금처럼 lead와 같은 작업 폴더에서 일합니다. 있으면 그 저장소의 lane 전용 git worktree에서 일합니다. `repo`는 절대 경로, `~/`로 시작하는 경로(`HOME` 기준), 작업 폴더 기준 상대 경로 중 하나이고, 풀어서 `canonicalize`한 경로를 `lanes.repo` 열에 저장하고 `lane_status`에도 보여 줍니다. 문자열이 아니거나 비면 `E_LANE_ARGS`, 있는 폴더가 아니면 `E_LANE_REPO`로 거절하고, 거절된 호출은 lane을 저장하지도 자식을 띄우지도 않습니다. 도구 처리기는 git을 부르지 않습니다.
@@ -735,6 +745,7 @@ The lane is still running and moraebot does not stop it; its result comes later 
 | 모델 | omp가 쓸 AI 모델 | omp 기본값 | 주인만 가능 (열린 질문 12) |
 | 교정 기록 | `[memory.self]`: `enabled`, `correction_patterns` (docs/memory.md#corrections). 옛 `[memory.jev]` 표는 무시하고 `W_CONFIG_IGNORED`로 알림 | 켜짐 | 불가 |
 | 기억 떠올리기 | `[memory.recall]`: `mode`(`on`/`shadow`/`off`), `model`, `mid_task`(빠지면 `mode`를 따름), `mid_max_delivered`(2), `mid_cooldown_minutes`(10), `wait_ms`(2500) 등 (docs/memory.md#settings). 옛 `mid_max_wakes_per_turn`, `mid_min_interval_seconds`는 무시하고 `W_CONFIG_IGNORED`로 알림 | `on`, 모델 `@smol` | 불가 |
+| 기억 정리 | `[memory.curate]`: `mode`(`on`/`shadow`/`off`), `model`, `idle_minutes`(30), `min_minutes_between`(120) (docs/memory.md#memory-tidy-curator) | `on`, 모델 `@smol` | 불가 |
 | lead 프롬프트 캐시 | `[lead] cache_minutes`: 마지막 턴 뒤 이만큼 쉬기 전에는 시스템 프롬프트를 그대로 두고 바뀐 기억을 갱신 블록으로 넣음. 0이면 바뀔 때마다 lead를 다시 켬 (3.9절) | 60분 | 불가 |
 
 규칙은 하나입니다. **봇을 빼앗을 수 있는 항목은 파일에서만 바꿉니다.**

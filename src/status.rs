@@ -193,6 +193,58 @@ fn recall_line(lang: Lang, recall: &RecallStatus) -> String {
     }
 }
 
+/// The memory curator line of a status answer at `now` (unix seconds): `None` when
+/// `memory.curate.mode = off`; otherwise the last run's age and counts, the failed runs on the
+/// current window when there are any, and whether the last run only logged (shadow).
+pub fn curate_line(lang: Lang, curate: Option<&crate::store::CurateStatus>, now: i64) -> String {
+    let Some(curate) = curate else {
+        return match lang {
+            Lang::Korean => "기억 정리: 꺼짐".to_owned(),
+            Lang::English => "Memory tidy: off.".to_owned(),
+        };
+    };
+    let mut parts = vec![match (lang, curate.last_run_at) {
+        (Lang::Korean, Some(at)) => format!("마지막 실행 {}", ago(lang, now - at)),
+        (Lang::English, Some(at)) => format!("last run {}", ago(lang, now - at)),
+        (Lang::Korean, None) => "아직 실행 안 함".to_owned(),
+        (Lang::English, None) => "not run yet".to_owned(),
+    }];
+    for (op, n) in &curate.last_counts {
+        let (ko, en) = match op.as_str() {
+            "save" => ("저장", "saved"),
+            "replace" => ("교체", "replaced"),
+            "promote" => ("핵심으로 올림", "promoted"),
+            "demote" => ("핵심에서 내림", "demoted"),
+            "unsave" => ("저장 취소", "unsaved"),
+            "forget" => ("지움", "forgot"),
+            "conflict" => ("충돌", "conflicts"),
+            "skipped" => ("건너뛴 구간", "skipped windows"),
+            _ => continue,
+        };
+        parts.push(match lang {
+            Lang::Korean => format!("{ko} {n}"),
+            Lang::English => format!("{en} {n}"),
+        });
+    }
+    if curate.window_failures > 0 {
+        parts.push(match lang {
+            Lang::Korean => format!("실패 {}", curate.window_failures),
+            Lang::English => format!("failures {}", curate.window_failures),
+        });
+    }
+    let mut line = match lang {
+        Lang::Korean => format!("기억 정리: {}", parts.join(", ")),
+        Lang::English => format!("Memory tidy: {}.", parts.join(", ")),
+    };
+    if curate.last_shadow {
+        line.push_str(match lang {
+            Lang::Korean => " (기록만 하고 적용은 안 했어요)",
+            Lang::English => " Shadow mode: nothing was applied.",
+        });
+    }
+    line
+}
+
 /// How long ago `secs` seconds is, in whole minutes, hours or days.
 pub fn ago(lang: Lang, secs: i64) -> String {
     let secs = secs.max(0);
@@ -254,6 +306,43 @@ fn first_line(task: &str, clean: &dyn Fn(&str) -> String) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::store::CurateStatus;
+
+    #[test]
+    fn curate_line_tells_the_last_run_its_counts_failures_and_off() {
+        let now = 100_000;
+        let mut status = CurateStatus {
+            last_run_at: Some(now - 2 * 3600),
+            last_run_id: Some(4),
+            last_counts: vec![
+                ("save".into(), 3),
+                ("replace".into(), 2),
+                ("promote".into(), 1),
+                ("conflict".into(), 1),
+            ],
+            last_shadow: false,
+            open_conflicts: vec![("m-aaaaaa".into(), "m-bbbbbb".into())],
+            window_failures: 0,
+            failed_runs: 5,
+        };
+        assert_eq!(
+            curate_line(Lang::English, Some(&status), now),
+            "Memory tidy: last run 2 h ago, saved 3, replaced 2, promoted 1, conflicts 1."
+        );
+        assert_eq!(
+            curate_line(Lang::Korean, Some(&status), now),
+            "기억 정리: 마지막 실행 2시간 전, 저장 3, 교체 2, 핵심으로 올림 1, 충돌 1"
+        );
+        status.window_failures = 2;
+        status.last_shadow = true;
+        assert_eq!(
+            curate_line(Lang::English, Some(&status), now),
+            "Memory tidy: last run 2 h ago, saved 3, replaced 2, promoted 1, conflicts 1, \
+             failures 2. Shadow mode: nothing was applied."
+        );
+        assert_eq!(curate_line(Lang::English, None, now), "Memory tidy: off.");
+        assert_eq!(curate_line(Lang::Korean, None, now), "기억 정리: 꺼짐");
+    }
     use crate::lane::news_text;
     use std::path::Path;
 

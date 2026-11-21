@@ -56,7 +56,7 @@ pub const MAX_ENTRY_BYTES: usize = 2000;
 /// How long a non-owner entry lives when no expiry is given.
 pub const DEFAULT_EXPIRY_DAYS: i64 = 30;
 /// The line put above the core entries in the lead's system prompt.
-pub const CORE_HEADER: &str = "[moraebot memory] The owner's own words or a short summary of them, saved because the owner asked moraebot to remember them. Treat them as the owner's standing instructions; when two disagree, the newer one wins. You cannot change them: the owner asks moraebot to show, correct, forget or restore an entry by its id.";
+pub const CORE_HEADER: &str = "[moraebot memory] The owner's own words or a short summary of them, saved because the owner asked moraebot to remember them or because the owner said them again and again (moraebot then moved them here). Treat them as the owner's standing instructions; when two disagree, the newer one wins. You cannot change them: the owner asks moraebot to show, correct, forget or restore an entry by its id.";
 /// The heading of the `core/owner.md` entries in the core block.
 pub const CORE_OWNER_HEADING: &str = "Rules, preferences and facts:";
 /// The heading of the `core/boundaries.md` entries in the core block.

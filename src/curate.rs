@@ -162,10 +162,9 @@ pub struct RunReport {
     pub failed: Option<String>,
 }
 
-/// Where the curator's calls go: omp, or scripted answers in tests.
+/// Where the curator's calls go: omp, or scripted answers in tests and the eval harness.
 enum Caller {
     Omp(Box<Summarizer>),
-    #[cfg(test)]
     Fake(Mutex<std::collections::VecDeque<Result<String, String>>>),
 }
 
@@ -456,7 +455,6 @@ impl Curator {
                     .ask(guidance, message, self.config.memory.curate.model())
                     .await
             }
-            #[cfg(test)]
             Caller::Fake(answers) => lock(answers)
                 .pop_front()
                 .unwrap_or_else(|| Err("no scripted answer".to_owned())),
@@ -509,9 +507,10 @@ impl Curator {
         }
     }
 
-    /// The same curator answering with `answers`, one per call, instead of omp.
-    #[cfg(test)]
-    fn with_answers(mut self, answers: Vec<Result<String, String>>) -> Self {
+    /// The same curator answering with `answers`, one per pass asked, instead of omp (tests
+    /// and `tests/curate_eval`).
+    #[doc(hidden)]
+    pub fn with_answers(mut self, answers: Vec<Result<String, String>>) -> Self {
         self.caller = Caller::Fake(Mutex::new(answers.into()));
         self
     }

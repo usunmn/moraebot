@@ -115,7 +115,7 @@
   },
   {
     "id": "ko-correction-name",
-    "description": "잘못 저장된 이름을 오너가 바로잡는다: 정정 문장이 저장되고 예전 이름은 대체된다",
+    "description": "잘못 저장된 이름을 오너가 바로잡는다: 정정 문장은 대화 파일에 저장되고, core 의 예전 이름과는 파일이 달라 대체 대신 충돌로 오너에게 보인다",
     "today": "2026-11-22",
     "entries": [
       {
@@ -147,16 +147,18 @@
       "no_save": [
         "미안 잘못 말했어"
       ],
-      "replace": [
+      "replace": [],
+      "conflict": [
         {
-          "old": "m-000031",
-          "by": "new:r41"
+          "a": "m-000031",
+          "b": "new:r41"
         }
       ],
-      "conflict": [],
       "promote": [],
       "forget": [],
-      "untouched": []
+      "untouched": [
+        "m-000031"
+      ]
     }
   },
   {
