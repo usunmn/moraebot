@@ -223,12 +223,23 @@ impl Day {
         let secs = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_or(0, |d| d.as_secs() as i64);
+        Day::from_unix_local(secs)
+    }
+
+    /// The local day (time zone of this machine) of the moment `secs` seconds after the
+    /// unix epoch.
+    pub fn from_unix_local(secs: i64) -> Day {
         let t = secs as libc::time_t;
         // SAFETY: `tm` is plain data that `localtime_r` fills; both pointers are valid.
         let mut tm: libc::tm = unsafe { std::mem::zeroed() };
         let filled = unsafe { !libc::localtime_r(&t, &mut tm).is_null() };
         let offset = if filled { tm.tm_gmtoff as i64 } else { 0 };
         Day((secs + offset).div_euclid(86_400))
+    }
+
+    /// The unix seconds at 00:00 UTC of this day.
+    pub fn unix_midnight_utc(self) -> i64 {
+        self.0 * 86_400
     }
 }
 
@@ -550,6 +561,12 @@ pub enum Op {
     /// the same text is in the target bucket. The archive check keeps a forgotten entry from
     /// coming back.
     AddUnique(NewEntry),
+    /// [`Op::AddUnique`] with the entry dated `day` instead of today (the curator saves a
+    /// sentence on the day its message came).
+    AddUniqueOn {
+        entry: NewEntry,
+        day: Day,
+    },
     /// Save `text` as an owner entry in the same file and archive `id` as replaced by it.
     Correct {
         id: String,
@@ -564,7 +581,9 @@ pub enum Op {
     Restore {
         id: String,
     },
-    /// Archive the live entry `id` as replaced by the live entry `by` of the same file.
+    /// Archive the live entry `id` as replaced by the live entry `by`: both of the same file,
+    /// or both owner entries of files other than `core/boundaries.md` and the self file (an
+    /// owner correction saved in another conversation).
     Supersede {
         id: String,
         by: String,
@@ -995,6 +1014,17 @@ pub fn live_text(root: &Path, text: &str, today: Day) -> Option<(String, Bucket)
                 .find(|e| e.text == wanted && !e.expired(today))?;
             Some((entry.id.clone(), file.bucket))
         })
+}
+
+/// Whether an archived entry names `id` as the entry that replaced it (`superseded_by`).
+pub fn replaces_archived(root: &Path, id: &str) -> bool {
+    md_files(root, "archive").into_iter().any(|rel| {
+        read_file(root, &rel).ok().flatten().is_some_and(|file| {
+            file.entries
+                .iter()
+                .any(|e| e.superseded_by.as_deref() == Some(id))
+        })
+    })
 }
 
 /// The bucket of every live file that parses, in file order.
@@ -2195,18 +2225,22 @@ impl MemoryStore {
 
     fn apply_one(&mut self, op: Op) -> Result<(Outcome, Option<CommitPart>), MemoryError> {
         match op {
-            Op::Add(entry) => self.add_op(entry, false),
-            Op::AddUnique(entry) => self.add_op(entry, true),
+            Op::Add(entry) => self.add_op(entry, false, None),
+            Op::AddUnique(entry) => self.add_op(entry, true, None),
+            Op::AddUniqueOn { entry, day } => self.add_op(entry, true, Some(day)),
             Op::Correct { id, text, src } => {
                 let old = self.live(&id)?;
-                let new = self.add_entry(NewEntry {
-                    text,
-                    prov: Prov::Owner,
-                    bucket: old.bucket.clone(),
-                    src,
-                    expires: None,
-                    why: None,
-                })?;
+                let new = self.add_entry(
+                    NewEntry {
+                        text,
+                        prov: Prov::Owner,
+                        bucket: old.bucket.clone(),
+                        src,
+                        expires: None,
+                        why: None,
+                    },
+                    None,
+                )?;
                 if new.id != id {
                     self.move_entry(&id, &old.bucket, false, Some(new.id.clone()))?;
                 }
@@ -2250,7 +2284,13 @@ impl MemoryStore {
             Op::Supersede { id, by } => {
                 let old = self.live(&id)?;
                 let new = self.live(&by)?;
-                if id == by || old.bucket != new.bucket {
+                let owner_files = |found: &Found| {
+                    found.entry.prov == Prov::Owner
+                        && !matches!(found.bucket, Bucket::Boundaries | Bucket::SelfObs)
+                };
+                if id == by
+                    || (old.bucket != new.bucket && !(owner_files(&old) && owner_files(&new)))
+                {
                     return Err(MemoryError::new(
                         E_MEMORY_BUCKET,
                         format!("{by} is not another entry of {}", old.bucket.label()),
@@ -2293,6 +2333,7 @@ impl MemoryStore {
         &mut self,
         entry: NewEntry,
         unique: bool,
+        day: Option<Day>,
     ) -> Result<(Outcome, Option<CommitPart>), MemoryError> {
         let (prov, bucket) = (entry.prov, entry.bucket.label());
         let reason = entry.why.clone().unwrap_or_else(|| "remember".into());
@@ -2303,7 +2344,7 @@ impl MemoryStore {
         };
         let added = match existing {
             Some(added) => added,
-            None => self.add_entry(entry)?,
+            None => self.add_entry(entry, day)?,
         };
         if added.created {
             tracing::info!(
@@ -2367,10 +2408,12 @@ impl MemoryStore {
         }
     }
 
-    fn add_entry(&mut self, new: NewEntry) -> Result<Added, MemoryError> {
+    /// Writes `new`, dated `day` (today when `None`).
+    fn add_entry(&mut self, new: NewEntry, day: Option<Day>) -> Result<Added, MemoryError> {
         let (text, redacted) = prepare(&new, &self.redactor)?;
         let rel = new.bucket.rel_path();
         let today = self.today();
+        let dated = day.unwrap_or(today);
         let mut file = self
             .read_own(&rel)?
             .unwrap_or_else(|| MemFile::empty(new.bucket.clone(), today));
@@ -2388,7 +2431,7 @@ impl MemoryStore {
             .or_else(|| (new.prov != Prov::Owner).then(|| today.plus_days(DEFAULT_EXPIRY_DAYS)));
         file.entries.push(Entry {
             id: id.clone(),
-            day: today,
+            day: dated,
             text,
             prov: new.prov,
             src: Some(new.src.as_str().to_string()),

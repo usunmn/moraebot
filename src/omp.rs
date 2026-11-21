@@ -2498,12 +2498,18 @@ fn log_event(name: &str, event: &Event) {
 /// line or end the block. Empty when there is nothing to show.
 pub fn core_memory_block(root: &Path, today: memory::Day) -> String {
     let guard = memory::MEMORY_GUARD;
-    let frame = CORE_MEMORY_OPEN.len() + guard.len() + CORE_MEMORY_CLOSE.len() + 3;
-    let core = memory::core_block(root, today, CORE_MEMORY_CAP_BYTES.saturating_sub(frame));
+    let core = memory::core_block(root, today, core_block_cap());
     if core.is_empty() {
         return core;
     }
     format!("{CORE_MEMORY_OPEN}\n{guard}\n{core}\n{CORE_MEMORY_CLOSE}")
+}
+
+/// The bytes [`memory::core_block`] may use inside [`core_memory_block`]: the cap less the
+/// frame lines (the curator checks a promotion against the same number).
+pub fn core_block_cap() -> usize {
+    let frame = CORE_MEMORY_OPEN.len() + memory::MEMORY_GUARD.len() + CORE_MEMORY_CLOSE.len() + 3;
+    CORE_MEMORY_CAP_BYTES.saturating_sub(frame)
 }
 
 /// The first line of conversation `key`'s memory block in a lead input.

@@ -199,6 +199,7 @@ fn scripted_first(seeded: &Seeded) -> (Value, Value) {
     let mut promote: Vec<String> = boundary_ids.clone();
     promote.extend(other_ids.iter().cloned());
     promote.extend(case.expect.promote.iter().map(|m| id(m)));
+    promote.extend(case.expect.promote_any.first().map(|m| id(m)));
     promote.extend(
         case.expect
             .untouched

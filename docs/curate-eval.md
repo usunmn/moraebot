@@ -29,8 +29,8 @@ Per case, against `expect`:
 
 - saves of credentials, URLs, commands and approvals, of pasted (`>` / `>>>` / Slack `&gt;`) lines, of sentence ids past the end or of rows outside the window, of a sentence already saved, of the same sentence twice;
 - saves into `core/owner`, `_general` or an unknown project, a DM sentence into a project, `until` before today or more than 90 days ahead;
-- replaces touching `boundaries`, backwards replaces (the newer entry as `old`), replaces between an owner and a reference entry or across files;
-- promotes of boundary, reference, core and single-mention entries; unsaves of entries the curator never saved; forgets of owner entries in both passes; a forget of an unknown id.
+- replaces touching `boundaries`, backwards replaces (the newer entry as `old`), replaces between an owner and a reference entry;
+- promotes of boundary, reference, core, project, `_general` and single-mention entries; unsaves of entries the curator never saved; forgets of owner entries in both passes; a forget of an unknown id.
 
 Every case must keep all of its gold, drop at least one op, change no owner entry it should not, save nothing forbidden and fail no run. `no_save` sentences that only the model can judge (small talk, a sentence about today only, an apology) pass every code check, so the scripted advisor does not offer them (`JUDGMENT_ONLY` in `tests/curate_eval/main.rs`); the live run scores them.
 

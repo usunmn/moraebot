@@ -578,7 +578,7 @@ const DROPPED_TABLES: [&str; 3] = ["memory_notices", "memory_jobs", "memory_curs
 
 /// Columns added after slice 2 as `(table, column, declaration)`; `Store::open` adds the
 /// missing ones to an older database.
-const ADDED_COLUMNS: [(&str, &str, &str); 13] = [
+const ADDED_COLUMNS: [(&str, &str, &str); 14] = [
     ("inbox", "attachments", "TEXT"),
     ("inbox", "files_ready", "INTEGER NOT NULL DEFAULT 1"),
     ("inbox", "out_files", "TEXT"),
@@ -592,6 +592,7 @@ const ADDED_COLUMNS: [(&str, &str, &str); 13] = [
     ("lanes", "closed_at", "TEXT"),
     ("lanes", "close_reason", "TEXT"),
     ("recall_ledger", "phase", "TEXT NOT NULL DEFAULT 'owner'"),
+    ("curate_log", "pending", "INTEGER NOT NULL DEFAULT 0"),
 ];
 
 const NOW: &str = "strftime('%Y-%m-%dT%H:%M:%fZ','now')";
@@ -1913,7 +1914,7 @@ impl Store {
         )?)
     }
 
-    /// The newest applied (not shadow) curator log row with `op` for `entry_id`.
+    /// The newest applied (not shadow, not pending) curator log row with `op` for `entry_id`.
     pub fn curate_logged(
         &self,
         op: &str,
@@ -1924,7 +1925,7 @@ impl Store {
             .query_row(
                 &format!(
                     "SELECT {CURATE_LOG_COLS} FROM curate_log
-                     WHERE op = ?1 AND entry_id = ?2 AND shadow = 0
+                     WHERE op = ?1 AND entry_id = ?2 AND shadow = 0 AND pending = 0
                      ORDER BY id DESC LIMIT 1"
                 ),
                 params![op, entry_id],
@@ -1933,15 +1934,144 @@ impl Store {
             .optional()?)
     }
 
-    /// Applied curator changes of the core file (promotions and demotions) at or after
-    /// `since` (unix seconds).
+    /// The newest applied change the curator made to entry `entry_id` (`save`, `replace`,
+    /// `promote`, `demote`, `unsave` or `forget`; conflicts and shadow rows left out).
+    pub fn curate_last_change(&self, entry_id: &str) -> Result<Option<CurateLogRow>, StoreError> {
+        Ok(self
+            .conn
+            .query_row(
+                &format!(
+                    "SELECT {CURATE_LOG_COLS} FROM curate_log
+                     WHERE entry_id = ?1 AND shadow = 0 AND pending = 0
+                       AND op IN ('save', 'replace', 'promote', 'demote', 'unsave', 'forget')
+                     ORDER BY id DESC LIMIT 1"
+                ),
+                [entry_id],
+                map_curate_log,
+            )
+            .optional()?)
+    }
+
+    /// Applied curator changes of the core file at or after `since` (unix seconds):
+    /// promotions, demotions, and replaces and unsaves of `core/owner` entries.
     pub fn curate_core_changes_since(&self, since: i64) -> Result<i64, StoreError> {
         Ok(self.conn.query_row(
             "SELECT COUNT(*) FROM curate_log
-             WHERE op IN ('promote', 'demote') AND shadow = 0 AND at >= ?1",
+             WHERE (op IN ('promote', 'demote')
+                    OR (op IN ('replace', 'unsave') AND bucket = 'core/owner'))
+               AND shadow = 0 AND at >= ?1",
             [since],
             |r| r.get(0),
         )?)
+    }
+
+    /// The lead's reply of the newest row of `conversation` before row `before` that has
+    /// one, `None` when there is none or its turn read text from outside the owner's
+    /// messages (the message the owner's row answered).
+    pub fn previous_reply(
+        &self,
+        conversation: &str,
+        before: i64,
+    ) -> Result<Option<String>, StoreError> {
+        let row: Option<(String, i64)> = self
+            .conn
+            .query_row(
+                "SELECT reply, reads_outside FROM inbox
+                 WHERE conversation_key = ?1 AND id < ?2 AND reply IS NOT NULL
+                 ORDER BY id DESC LIMIT 1",
+                params![conversation, before],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        Ok(row
+            .filter(|(_, outside)| *outside == 0)
+            .map(|(reply, _)| reply))
+    }
+
+    /// The last finished owner row from `owner` received before the UTC date `day`
+    /// (`YYYY-MM-DD`), 0 when there is none (where a first curator run starts).
+    pub fn curate_rows_before(&self, owner: &str, day: &str) -> Result<i64, StoreError> {
+        Ok(self.conn.query_row(
+            &format!(
+                "SELECT COALESCE(MAX(id), 0) FROM inbox WHERE {CURATE_WHERE} AND received_at < ?2"
+            ),
+            params![owner, day],
+            |r| r.get(0),
+        )?)
+    }
+
+    /// Writes `rows` as pending curator log rows before their changes are applied, so a
+    /// crash between the memory commit and the log cannot hide a change; returns their ids.
+    pub fn log_curate_pending(&mut self, rows: &[CurateLogRow]) -> Result<Vec<i64>, StoreError> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut ids = Vec::with_capacity(rows.len());
+        for row in rows {
+            ids.push(tx.query_row(
+                "INSERT INTO curate_log(run_id, at, op, entry_id, other_id, bucket, detail, shadow, pending)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, 1) RETURNING id",
+                params![
+                    row.run_id,
+                    row.at,
+                    row.op,
+                    row.entry_id,
+                    row.other_id,
+                    row.bucket,
+                    row.detail
+                ],
+                |r| r.get(0),
+            )?);
+        }
+        tx.commit()?;
+        Ok(ids)
+    }
+
+    /// The pending curator log rows (`id`, row), oldest first.
+    pub fn pending_curate_log(&self) -> Result<Vec<(i64, CurateLogRow)>, StoreError> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT id, {CURATE_LOG_COLS} FROM curate_log WHERE pending = 1 ORDER BY id"
+        ))?;
+        let rows = stmt.query_map([], |r| {
+            let id: i64 = r.get(0)?;
+            Ok((
+                id,
+                CurateLogRow {
+                    run_id: r.get(1)?,
+                    at: r.get(2)?,
+                    op: r.get(3)?,
+                    entry_id: r.get(4)?,
+                    other_id: r.get(5)?,
+                    bucket: r.get(6)?,
+                    detail: r.get(7)?,
+                    shadow: r.get::<_, i64>(8)? != 0,
+                },
+            ))
+        })?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// Settles pending curator log rows in one transaction: each of `applied` (`id`, entry
+    /// id now) is kept with that entry id; each of `dropped` is deleted.
+    pub fn settle_curate_log(
+        &mut self,
+        applied: &[(i64, String)],
+        dropped: &[i64],
+    ) -> Result<(), StoreError> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        for (id, entry) in applied {
+            tx.execute(
+                "UPDATE curate_log SET pending = 0, entry_id = ?2 WHERE id = ?1",
+                params![id, entry],
+            )?;
+        }
+        for id in dropped {
+            tx.execute("DELETE FROM curate_log WHERE id = ?1", [id])?;
+        }
+        tx.commit()?;
+        Ok(())
     }
 
     /// Ends a curator run in one transaction: writes `rows`, moves the cursor to `cursor`
@@ -1995,7 +2125,7 @@ impl Store {
     /// The newest `limit` curator log rows, newest first (the owner's "recent cleanup").
     pub fn recent_curate_log(&self, limit: usize) -> Result<Vec<CurateLogRow>, StoreError> {
         let mut stmt = self.conn.prepare(&format!(
-            "SELECT {CURATE_LOG_COLS} FROM curate_log ORDER BY id DESC LIMIT ?1"
+            "SELECT {CURATE_LOG_COLS} FROM curate_log WHERE pending = 0 ORDER BY id DESC LIMIT ?1"
         ))?;
         let rows = stmt.query_map([i64::try_from(limit).unwrap_or(i64::MAX)], map_curate_log)?;
         Ok(rows.collect::<Result<_, _>>()?)
@@ -2008,7 +2138,7 @@ impl Store {
         let rows: Vec<CurateLogRow> = match last_run_id {
             Some(run) => {
                 let mut stmt = self.conn.prepare(&format!(
-                    "SELECT {CURATE_LOG_COLS} FROM curate_log WHERE run_id = ?1 ORDER BY id"
+                    "SELECT {CURATE_LOG_COLS} FROM curate_log WHERE run_id = ?1 AND pending = 0 ORDER BY id"
                 ))?;
                 stmt.query_map([run], map_curate_log)?
                     .collect::<Result<_, _>>()?
@@ -2059,6 +2189,16 @@ impl Store {
         self.conn.execute(
             "UPDATE inbox SET received_at = ?2 WHERE id = ?1",
             params![id, at],
+        )?;
+        Ok(())
+    }
+
+    /// Sets row `id`'s lead reply and whether its turn read outside text (tests).
+    #[cfg(test)]
+    pub(crate) fn set_reply(&self, id: i64, reply: &str, outside: bool) -> Result<(), StoreError> {
+        self.conn.execute(
+            "UPDATE inbox SET reply = ?2, reads_outside = ?3 WHERE id = ?1",
+            params![id, reply, i64::from(outside)],
         )?;
         Ok(())
     }

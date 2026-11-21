@@ -56,6 +56,13 @@ pub struct Expect {
     pub promote: Vec<String>,
     pub forget: Vec<String>,
     pub untouched: Vec<String>,
+    /// Entries saying the same thing: promoting any one of them is the hit, and they may be
+    /// replaced by one another (a duplicate folded into the promoted one).
+    #[serde(default)]
+    pub promote_any: Vec<String>,
+    /// Saves that are fine but not required (a repeat of a saved preference, for example).
+    #[serde(default)]
+    pub maybe_save: Vec<ExpectSave>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -428,7 +435,12 @@ pub fn score(seeded: &Seeded, reports: &[RunReport]) -> Score {
     s.saves = saved.len();
     s.gold_saves = case.expect.save.len();
     for found in &saved {
-        let good = case.expect.save.iter().any(|g| save_ok(g, found));
+        let good = case
+            .expect
+            .save
+            .iter()
+            .chain(&case.expect.maybe_save)
+            .any(|g| save_ok(g, found));
         s.good_saves += usize::from(good);
         if !good {
             s.notes.push(format!(
@@ -491,6 +503,25 @@ pub fn score(seeded: &Seeded, reports: &[RunReport]) -> Score {
             s.notes.push(format!("missed promote {id}"));
         }
     }
+    if !case.expect.promote_any.is_empty() {
+        let group: Vec<String> = case
+            .expect
+            .promote_any
+            .iter()
+            .map(|id| seeded.id(id))
+            .collect();
+        let ok = group.iter().any(|id| {
+            let found = find(&root, id);
+            !found.archived && found.bucket == Bucket::Owner
+        });
+        hit(&mut s.promote, ok);
+        if !ok {
+            s.notes.push(format!(
+                "missed promote of one of {:?}",
+                case.expect.promote_any
+            ));
+        }
+    }
     for id in &case.expect.forget {
         let ok = find(&root, &seeded.id(id)).archived;
         hit(&mut s.forget, ok);
@@ -506,6 +537,7 @@ pub fn score(seeded: &Seeded, reports: &[RunReport]) -> Score {
         .iter()
         .map(|p| seeded.id(&p.old))
         .chain(case.expect.promote.iter().map(|id| seeded.id(id)))
+        .chain(case.expect.promote_any.iter().map(|id| seeded.id(id)))
         .collect();
     let untouched: HashSet<String> = case
         .expect

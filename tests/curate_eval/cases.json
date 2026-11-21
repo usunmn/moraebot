@@ -115,7 +115,7 @@
   },
   {
     "id": "ko-correction-name",
-    "description": "잘못 저장된 이름을 오너가 바로잡는다: 정정 문장은 대화 파일에 저장되고, core 의 예전 이름과는 파일이 달라 대체 대신 충돌로 오너에게 보인다",
+    "description": "잘못 저장된 이름을 오너가 바로잡는다: 정정 문장은 대화 파일에 저장되고, 다음 실행에서 core 의 예전 이름을 대체하며 core 로 올라간다",
     "today": "2026-11-22",
     "entries": [
       {
@@ -141,24 +141,23 @@
       "save": [
         {
           "row": 41,
-          "contains": "너 이름은 모래봇이야"
+          "contains": "너 이름은 모래봇이야",
+          "bucket": "core/owner"
         }
       ],
       "no_save": [
         "미안 잘못 말했어"
       ],
-      "replace": [],
-      "conflict": [
+      "replace": [
         {
-          "a": "m-000031",
-          "b": "new:r41"
+          "old": "m-000031",
+          "by": "new:r41"
         }
       ],
+      "conflict": [],
       "promote": [],
       "forget": [],
-      "untouched": [
-        "m-000031"
-      ]
+      "untouched": []
     }
   },
   {
@@ -868,7 +867,7 @@
   },
   {
     "id": "ko-repeated-promote",
-    "description": "서로 다른 날 같은 말을 반복한 오너 항목은 core/owner 로 승격된다",
+    "description": "항목의 원래 메시지 말고도 서로 다른 두 날 같은 말을 반복한 대화 항목은 core/owner 로 승격된다 (반복한 말을 따로 저장하는 건 해도 되고 안 해도 된다)",
     "today": "2026-11-22",
     "entries": [
       {
@@ -882,6 +881,14 @@
     ],
     "rows": [
       {
+        "id": 365,
+        "conversation": "slack:th:C0EVAL:0365",
+        "date": "2026-11-12",
+        "text": "리뷰 코멘트는 핵심만 짧게 달아줘.",
+        "reply": "알겠어요.",
+        "reads_outside": false
+      },
+      {
         "id": 371,
         "conversation": "slack:th:C0EVAL:0371",
         "date": "2026-11-21",
@@ -891,12 +898,7 @@
       }
     ],
     "expect": {
-      "save": [
-        {
-          "row": 371,
-          "contains": "핵심만 짧게"
-        }
-      ],
+      "save": [],
       "no_save": [],
       "replace": [],
       "conflict": [],
@@ -904,21 +906,39 @@
         "m-000101"
       ],
       "forget": [],
-      "untouched": []
+      "untouched": [],
+      "maybe_save": [
+        {
+          "row": 365,
+          "contains": "핵심만 짧게"
+        },
+        {
+          "row": 371,
+          "contains": "핵심만 짧게"
+        }
+      ]
     }
   },
   {
     "id": "en-repeated-promote",
-    "description": "Owner said the same preference on two days: promoted to core",
+    "description": "Owner said the same preference on three days (three conversation entries): one of them is promoted to core, and the others may be folded into it",
     "today": "2026-11-22",
     "entries": [
       {
         "id": "m-000111",
-        "bucket": "general",
+        "bucket": "thread:slack:th:C0EVAL:0140",
         "prov": "owner",
         "day": "2026-10-20",
         "src": "row=140 s=0 turn=140",
         "text": "Use 24-hour time in every message."
+      },
+      {
+        "id": "m-000113",
+        "bucket": "thread:slack:th:C0EVAL:0385",
+        "prov": "owner",
+        "day": "2026-11-18",
+        "src": "row=385 s=0 turn=385",
+        "text": "Always use 24-hour time in every message."
       },
       {
         "id": "m-000112",
@@ -935,11 +955,14 @@
       "no_save": [],
       "replace": [],
       "conflict": [],
-      "promote": [
-        "m-000111"
-      ],
+      "promote": [],
       "forget": [],
-      "untouched": []
+      "untouched": [],
+      "promote_any": [
+        "m-000111",
+        "m-000112",
+        "m-000113"
+      ]
     }
   },
   {
