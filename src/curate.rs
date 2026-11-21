@@ -269,6 +269,9 @@ impl Curator {
     /// logged, and failed owner passes on a window are counted.
     pub async fn run_once(&self, now_unix: i64) -> RunReport {
         settle_pending(&self.store, self.memory.root());
+        if let Err(err) = lock(&self.store).prune_curate_log(now_unix) {
+            tracing::warn!(code = err.code(), "old curator log rows not pruned");
+        }
         let Loaded {
             run_id,
             state,

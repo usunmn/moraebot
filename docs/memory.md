@@ -248,7 +248,7 @@ Each filter list replaces its built-in list. A pattern of only ASCII letters, di
 
 ## Codes in the memory log
 
-The `memory_log` table of `inbox.sqlite` keeps the recall advisor's rows and the omp version notice for 30 days (pruned when moraebot starts).
+The `memory_log` table of `inbox.sqlite` keeps the recall advisor's rows and the omp version notice for 30 days (pruned when moraebot starts). The curator's `curate_log` rows are pruned after 30 days too, at start and before each curator run, except the rows the curator still reads: pending rows, the newest run's rows, and per entry its newest change, its newest promotion and its newest save (so undo, demotion and unsave keep working).
 
 | Code | Meaning |
 | --- | --- |

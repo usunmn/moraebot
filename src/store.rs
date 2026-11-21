@@ -569,6 +569,8 @@ CREATE TABLE IF NOT EXISTS curate_log(
     shadow INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS curate_log_entry ON curate_log(entry_id);
+CREATE INDEX IF NOT EXISTS curate_log_run ON curate_log(run_id);
+CREATE INDEX IF NOT EXISTS curate_log_at ON curate_log(at);
 ";
 
 /// Tables an older version created and nothing reads any more; `Store::open` drops them.
@@ -932,7 +934,8 @@ impl Store {
         )?)
     }
 
-    /// Deletes memory log rows and recall ledger rows older than 30 days before `now`.
+    /// Deletes memory log rows and recall ledger rows older than 30 days before `now`, and
+    /// old curator log rows ([`Store::prune_curate_log`]).
     pub fn prune_memory(&mut self, now: i64) -> Result<(), StoreError> {
         let cutoff = now - MEMORY_KEEP_SECONDS;
         let tx = self
@@ -941,6 +944,31 @@ impl Store {
         tx.execute("DELETE FROM memory_log WHERE at < ?1", [cutoff])?;
         tx.execute("DELETE FROM recall_ledger WHERE at < ?1", [cutoff])?;
         tx.commit()?;
+        self.prune_curate_log(now)
+    }
+
+    /// Deletes curator log rows older than 30 days before `now`, except the rows the curator
+    /// still reads: pending rows, the newest run's rows (the status line), and per entry its
+    /// newest applied change (the owner-undo check), its newest `promote` (a demotion's old
+    /// bucket) and its newest `save` (an unsave). So the table stays small while every rule
+    /// that reads it gives the same answer.
+    pub fn prune_curate_log(&mut self, now: i64) -> Result<(), StoreError> {
+        let cutoff = now - MEMORY_KEEP_SECONDS;
+        self.conn.execute(
+            "DELETE FROM curate_log
+             WHERE at < ?1 AND pending = 0
+               AND run_id <> (SELECT COALESCE(MAX(run_id), 0) FROM curate_log)
+               AND id NOT IN (
+                   SELECT MAX(id) FROM curate_log
+                   WHERE shadow = 0 AND pending = 0
+                     AND op IN ('save', 'replace', 'promote', 'demote', 'unsave', 'forget')
+                   GROUP BY entry_id)
+               AND id NOT IN (
+                   SELECT MAX(id) FROM curate_log
+                   WHERE shadow = 0 AND pending = 0 AND op IN ('save', 'promote')
+                   GROUP BY entry_id, op)",
+            [cutoff],
+        )?;
         Ok(())
     }
 
@@ -4111,6 +4139,69 @@ mod tests {
             store.recall_seen("a", 1, 0, 0).unwrap().len(),
             1,
             "only the row at 500 is left"
+        );
+    }
+
+    /// moraedang on #78: old curator log rows go, but every row a curator rule still reads stays.
+    #[test]
+    fn old_curator_log_rows_go_but_the_rows_rules_read_stay() {
+        let (_d, _p, mut s) = open_tmp();
+        let row = |run_id: i64, at: i64, op: &str, entry: &str, shadow: bool| CurateLogRow {
+            run_id,
+            at,
+            op: op.into(),
+            entry_id: entry.into(),
+            other_id: None,
+            bucket: "thread:k".into(),
+            detail: None,
+            shadow,
+        };
+        s.finish_curate_run(
+            &[
+                row(1, 100, "save", "m-a", false),
+                row(1, 100, "promote", "m-a", false),
+                row(1, 100, "save", "m-b", true),
+                row(1, 100, "conflict", "m-c", false),
+                row(2, 200, "save", "m-d", false),
+                row(2, 200, "replace", "m-d", false),
+            ],
+            None,
+            200,
+            0,
+            false,
+        )
+        .unwrap();
+        s.finish_curate_run(&[row(3, 300, "forget", "m-e", false)], None, 300, 0, false)
+            .unwrap();
+        s.log_curate_pending(&[row(3, 50, "save", "m-f", false)])
+            .unwrap();
+        s.prune_memory(1000 + MEMORY_KEEP_SECONDS).unwrap();
+
+        let mut kept: Vec<(String, String)> = s
+            .conn
+            .prepare("SELECT op, entry_id FROM curate_log ORDER BY id")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        kept.sort();
+        let want: Vec<(String, String)> = [
+            ("forget", "m-e"),  // the newest run (status line)
+            ("promote", "m-a"), // newest change of m-a, and its promote (demotion)
+            ("replace", "m-d"), // newest change of m-d (owner undo)
+            ("save", "m-a"),    // m-a's save (unsave)
+            ("save", "m-d"),    // m-d's save
+            ("save", "m-f"),    // pending
+        ]
+        .iter()
+        .map(|(o, e)| ((*o).to_owned(), (*e).to_owned()))
+        .collect();
+        assert_eq!(kept, want, "a shadow save and an old conflict go");
+        assert!(s.curate_logged("promote", "m-a").unwrap().is_some());
+        assert_eq!(
+            s.curate_last_change("m-d").unwrap().map(|r| r.op),
+            Some("replace".to_owned())
         );
     }
 }
