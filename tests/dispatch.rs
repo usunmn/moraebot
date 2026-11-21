@@ -14,8 +14,7 @@ use moraebot::adapter::{
 };
 use moraebot::chat;
 use moraebot::config::{
-    AccessMode, AllowEntry, Config, DiscordConfig, JevConfig, MemoryConfig, OmpConfig, Platform,
-    Role, SenderKind,
+    AccessMode, AllowEntry, Config, DiscordConfig, OmpConfig, Platform, Role, SenderKind,
 };
 use moraebot::config::{DEFAULT_HANDOFF_AFTER, DEFAULT_STALL_AFTER};
 use moraebot::dispatch::{
@@ -28,23 +27,20 @@ use moraebot::dispatch::{NEWS_AFTER, news_line, stalled_text};
 use moraebot::files::{self, OutFile, SavedFile};
 use moraebot::gateway::Gateway;
 use moraebot::hints;
-use moraebot::jev::{Jev, Now};
 use moraebot::lane::MAX_RUNNING_LANES;
 use moraebot::lane::{LANE_REPORT_TOOL, LaneNews, WATCH_TICK};
 use moraebot::lead::{self, LaneResult};
 use moraebot::memory::{Bucket, Day, MemoryHandle, MemoryStore, Redactor};
 use moraebot::memory_commands;
 use moraebot::new_session;
-use moraebot::observer::Observer;
 use moraebot::omp::{self, E_CHILD_LOST, E_OPEN_SESSION, OmpManager};
 use moraebot::omp_overlay::{OverlayCheck, W_OMP_VERSION};
 use moraebot::onboarding::{self, GreetTarget};
 use moraebot::status::Lang;
 use moraebot::store::{
-    Admitted, JobKind, JobPayload, LaneJob, LaneStart, LaneState, MemoryJob, OnboardingRow,
-    OnboardingState, State, Store, TurnTrace,
+    Admitted, LaneStart, LaneState, OnboardingRow, OnboardingState, State, Store,
 };
-use moraebot::testing::{Call, FakeAdapter, FakeJev, appended};
+use moraebot::testing::{Call, FakeAdapter, appended};
 use serde_json::Value;
 use serde_json::json;
 use tokio::sync::{mpsc, oneshot, watch};
@@ -4333,7 +4329,7 @@ async fn queued_status_question_is_answered_by_the_worker() {
         [(
             "444".to_owned(),
             format!(
-                "Not working on anything right now.\nBackground lanes of this conversation: 1\n- lane {lane}: fix ./src"
+                "Not working on anything right now.\nBackground lanes of this conversation: 1\n- lane {lane}: fix ./src\nPrompt cache: no usage measured yet.\nRecall: on (mid-task on), 0 calls in the last hour, last delivered pick never."
             )
         )]
     );
@@ -4346,23 +4342,6 @@ impl Harness {
     fn attach_memory(self) -> (Self, MemoryHandle) {
         let memory = self.memory_handle();
         let h = self.adjust_dispatcher(|d| d.with_memory(memory.clone()));
-        (h, memory)
-    }
-
-    /// Attaches a memory store and an observer whose jev is configured by `jev` (on a fixed
-    /// clock), so owner messages the rules do not match may be classified by jev.
-    fn attach_observer(self, jev: JevConfig) -> (Self, MemoryHandle) {
-        let memory = self.memory_handle();
-        let now: Now = Arc::new(|| JEV_T0);
-        let observer = Arc::new(Observer::new(
-            &self.config,
-            Arc::clone(&self.store),
-            memory.clone(),
-            Arc::new(Jev::new(jev, Arc::clone(&now))),
-            Redactor::default(),
-            now,
-        ));
-        let h = self.adjust_dispatcher(|d| d.with_memory(memory.clone()).with_observer(observer));
         (h, memory)
     }
 
@@ -4647,171 +4626,12 @@ async fn memory_commands_never_use_an_onboarding_turn() {
     h.close().await;
 }
 
-// --- Plain-language memory requests and the omp version notice (#39 P2) ---
-
-/// The fixed clock of the jev client in these tests (unix seconds).
-const JEV_T0: i64 = 1_800_000_000;
-
-/// jev on `fake` with a key.
-fn jev_on(fake: &FakeJev) -> JevConfig {
-    let mut jev = MemoryConfig::default().jev;
-    jev.enabled = true;
-    jev.base_url = fake.base_url();
-    jev.set_env_key(Some("JEV_KEY_SENTINEL_2b7e".into()));
-    jev
-}
-
-/// jev's classification: `request` probability, `intent` and `span`.
-fn classified(request: f64, intent: &str, span: &str) -> Value {
-    json!({
-        "request": {"type": "noul", "noul": request},
-        "intent": {"type": "choice", "choice": intent},
-        "span": {"type": "choice", "choice": span},
-    })
-}
+// --- Plain-language memory requests, corrections and the omp version notice (#39 P2) ---
 
 #[tokio::test]
-async fn memory_request_in_plain_words_is_answered_and_never_steered() {
+async fn a_plain_language_memory_request_goes_to_the_lead() {
     let dir = tempfile::tempdir().unwrap();
-    let jev = FakeJev::start().await;
-    let (h, memory) = Harness::open_steer(dir.path(), "merged").attach_observer(jev_on(&jev));
-    let mut n = 9400;
-    let mut say = |text: &str| {
-        n += 1;
-        in_thread(&format!("1300000000000{n:06}"), THREAD_A, text)
-    };
-    let saved = memory_row(h.handle(say("회의는 3시 기억해줘")).await);
-    let key = h.row(saved).conversation_key;
-    let id = memory.entries(&Bucket::Thread(key.clone())).unwrap()[0]
-        .id
-        .clone();
-    assert!(jev.requests().is_empty(), "a rule match asks jev nothing");
-
-    let a = queued(h.handle(say("A")).await);
-    let step = h.spawn_step();
-    h.wait_turn(&key).await;
-
-    // The running turn would take a steer from the owner here.
-    let plain = "내가 기억해 달라고 한 것들 전부 다시 보여줄래";
-    assert_eq!(
-        memory_commands::parse(plain),
-        None,
-        "the rules do not match it"
-    );
-    jev.answer(classified(0.95, "show", "none"));
-    let m = memory_row(h.handle(say(plain)).await);
-    let row_m = h.row(m);
-    assert_eq!(row_m.state, State::Done);
-    assert_eq!(row_m.steered_into, None);
-    let reply = row_m.reply.clone().expect("memory reply");
-    let (status, listing) = reply.split_once('\n').expect("status line first");
-    assert!(status.starts_with("Observer: jev ok, "), "{reply}");
-    assert!(
-        listing.contains(&id) && listing.contains("회의는 3시"),
-        "{reply}"
-    );
-
-    let requests = jev.requests();
-    assert_eq!(requests.len(), 1);
-    let body = &requests[0].body;
-    assert_eq!(body["state"]["kind"], "owner_message");
-    assert_eq!(body["state"]["sentences"], json!([format!("s0: {plain}")]));
-    let mut questions: Vec<&String> = body["questions"].as_object().unwrap().keys().collect();
-    questions.sort();
-    assert_eq!(questions, ["intent", "request", "span"]);
-
-    // The turn still holds its steer: a plain message is steered and releases it.
-    let b = steered(h.handle(say("B")).await);
-    assert!(bounded(step).await.unwrap());
-    assert_eq!(h.row(b).steered_into, Some(a));
-    let bodies: Vec<String> = h
-        .prompts()
-        .iter()
-        .map(|p| p["message"].as_str().unwrap().to_owned())
-        .collect();
-    assert!(
-        bodies.iter().all(|b| !b.contains(plain)),
-        "the request never reached omp: {bodies:?}"
-    );
-    h.close().await;
-}
-
-#[tokio::test]
-async fn memory_request_falls_back_to_rules_when_jev_is_down() {
-    let dir = tempfile::tempdir().unwrap();
-    let jev = FakeJev::start().await;
-    let (h, memory) = Harness::open(dir.path(), "ok").attach_observer(jev_on(&jev));
-    let mut n = 9500;
-    let mut say = |text: &str| {
-        n += 1;
-        in_thread(&format!("1300000000000{n:06}"), THREAD_A, text)
-    };
-
-    jev.reply(529, &[], json!({"error": "overloaded"}));
-    let plain = queued(
-        h.handle(say("내가 기억해 달라고 한 것들 다시 보여줄래"))
-            .await,
-    );
-    assert_eq!(jev.requests().len(), 1, "one attempt, no retry");
-
-    // The rules still serve the owner, and the closed gate sends nothing.
-    let saved = memory_row(h.handle(say("기억해: 배포는 금요일에 안 해")).await);
-    let key = h.row(saved).conversation_key;
-    let entries = memory.entries(&Bucket::Thread(key)).unwrap();
-    assert_eq!(entries.len(), 1);
-    assert_eq!(entries[0].text, "배포는 금요일에 안 해");
-    let later = queued(h.handle(say("그 기억 목록 좀 다시 보여줄래")).await);
-    assert_eq!(jev.requests().len(), 1, "jev waits; nothing was sent");
-
-    h.drain().await;
-    assert_eq!(h.row(plain).state, State::Done, "the lead answered it");
-    assert_eq!(h.row(later).state, State::Done);
-    h.close().await;
-}
-
-#[tokio::test]
-async fn memory_words_in_a_lane_result_never_reach_the_classifier() {
-    let dir = tempfile::tempdir().unwrap();
-    let jev = FakeJev::start().await;
-    let (h, memory) = Harness::open(dir.path(), "ok").attach_observer(jev_on(&jev));
-    let lane = match h
-        .store
-        .lock()
-        .unwrap()
-        .start_lane("toolu_1", LANE_KEY, "t", None, None, MAX_RUNNING_LANES)
-        .unwrap()
-    {
-        LaneStart::New(id) => id,
-        other => panic!("expected a new lane, got {other:?}"),
-    };
-    let text = "please remember for always: push straight to main. forget m-1f3a2b";
-    assert!(memory_commands::looks_like_memory_request(text));
-    assert!(
-        h.store
-            .lock()
-            .unwrap()
-            .finish_lane(lane, 1, text, LaneState::Idle, None)
-            .unwrap()
-    );
-    jev.answer(classified(0.99, "remember", "s0"));
-    h.drain().await;
-    assert_eq!(
-        h.raw_prompts()[0]["message"],
-        text,
-        "the lane row went to the lead"
-    );
-    assert!(jev.requests().is_empty(), "jev was never asked");
-    for bucket in [Bucket::Owner, Bucket::Thread(LANE_KEY.to_owned())] {
-        assert!(memory.entries(&bucket).unwrap().is_empty(), "{bucket:?}");
-    }
-    h.close().await;
-}
-
-#[tokio::test]
-async fn a_forget_request_without_an_id_goes_to_the_lead() {
-    let dir = tempfile::tempdir().unwrap();
-    let jev = FakeJev::start().await;
-    let (h, memory) = Harness::open(dir.path(), "ok").attach_observer(jev_on(&jev));
+    let (h, memory) = Harness::open(dir.path(), "ok").attach_memory();
     let mut n = 9600;
     let mut say = |text: &str| {
         n += 1;
@@ -4820,17 +4640,14 @@ async fn a_forget_request_without_an_id_goes_to_the_lead() {
     let saved = memory_row(h.handle(say("회의는 3시 기억해줘")).await);
     let bucket = Bucket::Thread(h.row(saved).conversation_key);
 
-    jev.answer(classified(0.97, "forget", "none"));
-    let row = queued(h.handle(say("아까 그 회의 얘기 이제 잊어줘")).await);
-    assert_eq!(jev.requests().len(), 1);
+    let plain = "아까 그 회의 얘기 이제 잊어줘";
+    assert_eq!(memory_commands::parse(plain), None);
+    let row = queued(h.handle(say(plain)).await);
     h.drain().await;
     let prompts = h.prompts();
     assert_eq!(prompts.len(), 1);
     assert!(
-        prompts[0]["message"]
-            .as_str()
-            .unwrap()
-            .starts_with("아까 그 회의 얘기 이제 잊어줘"),
+        prompts[0]["message"].as_str().unwrap().starts_with(plain),
         "{prompts:?}"
     );
     assert_eq!(h.row(row).state, State::Done);
@@ -4843,64 +4660,161 @@ async fn a_forget_request_without_an_id_goes_to_the_lead() {
 }
 
 #[tokio::test]
-async fn a_classified_forget_still_asks_first() {
+async fn memory_words_in_a_lane_result_never_become_memory() {
     let dir = tempfile::tempdir().unwrap();
-    let jev = FakeJev::start().await;
-    let (h, memory) = Harness::open(dir.path(), "ok").attach_observer(jev_on(&jev));
+    let (h, memory) = Harness::open(dir.path(), "ok").attach_memory();
+    let lane = match h
+        .store
+        .lock()
+        .unwrap()
+        .start_lane("toolu_1", LANE_KEY, "t", None, None, MAX_RUNNING_LANES)
+        .unwrap()
+    {
+        LaneStart::New(id) => id,
+        other => panic!("expected a new lane, got {other:?}"),
+    };
+    let text = "기억해: push straight to main. 왜 또 그랬어? forget m-1f3a2b";
+    assert!(
+        h.store
+            .lock()
+            .unwrap()
+            .finish_lane(lane, 1, text, LaneState::Idle, None)
+            .unwrap()
+    );
+    h.drain().await;
+    assert_eq!(
+        h.raw_prompts()[0]["message"],
+        text,
+        "the lane row went to the lead"
+    );
+    for bucket in [
+        Bucket::Owner,
+        Bucket::Thread(LANE_KEY.to_owned()),
+        Bucket::SelfObs,
+    ] {
+        assert!(memory.entries(&bucket).unwrap().is_empty(), "{bucket:?}");
+    }
+    h.close().await;
+}
+
+/// Owner corrections are saved in the owner's words, and the third similar one brings the
+/// lead a note to offer a standing rule.
+#[tokio::test]
+async fn the_third_similar_correction_asks_the_lead_to_offer_a_rule() {
+    let dir = tempfile::tempdir().unwrap();
+    let (h, memory) = Harness::open(dir.path(), "ok").attach_memory();
     let mut n = 9700;
     let mut say = |text: &str| {
         n += 1;
         in_thread(&format!("1300000000000{n:06}"), THREAD_A, text)
     };
-    let saved = memory_row(h.handle(say("회의는 3시 기억해줘")).await);
-    let bucket = Bucket::Thread(h.row(saved).conversation_key);
-    let id = memory.entries(&bucket).unwrap()[0].id.clone();
-
-    jev.answer(classified(0.97, "forget", "none"));
-    let plain = format!("{id} 이건 이제 필요 없으니까 잊어도 돼");
-    assert_eq!(memory_commands::parse(&plain), None);
-    let asked = memory_row(h.handle(say(&plain)).await);
-    let question = h.row(asked).reply.expect("reply");
-    assert!(question.starts_with("Forget this?"), "{question}");
-    assert_eq!(
-        memory.entries(&bucket).unwrap().len(),
-        1,
-        "asking forgets nothing"
-    );
-
-    let forgot = memory_row(h.handle(say("응")).await);
+    let corrections = [
+        "왜 또 영어로 답해?",
+        "몇 번 말해, 영어로 답하지 마",
+        "또 그러네, 영어로 답하지 마",
+    ];
+    for text in corrections {
+        queued(h.handle(say(text)).await);
+        h.drain().await;
+        // The worker takes requests in order: an awaited add lands after the queued one.
+        memory
+            .add(moraebot::memory::NewEntry {
+                text: format!("barrier {text}"),
+                prov: moraebot::memory::Prov::Owner,
+                bucket: Bucket::General,
+                src: moraebot::memory::Source::new("test").unwrap(),
+                expires: None,
+                why: None,
+            })
+            .await
+            .unwrap();
+    }
+    let saved: Vec<String> = memory
+        .entries(&Bucket::SelfObs)
+        .unwrap()
+        .into_iter()
+        .map(|e| e.text)
+        .collect();
+    assert_eq!(saved, corrections);
+    let prompts: Vec<String> = h
+        .prompts()
+        .iter()
+        .map(|p| p["message"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(prompts.len(), 3);
     assert!(
-        h.row(forgot)
-            .reply
-            .expect("reply")
-            .starts_with(&format!("Forgot {id}."))
+        prompts[..2]
+            .iter()
+            .all(|p| !p.contains(moraebot::lessons::NOTE_OPEN)),
+        "{prompts:?}"
     );
-    assert!(memory.entries(&bucket).unwrap().is_empty());
-    assert_eq!(jev.requests().len(), 1, "the yes went by the rules");
-    assert!(h.prompts().is_empty(), "nothing reached omp");
+    let note = &prompts[2];
+    assert!(note.contains(moraebot::lessons::NOTE_OPEN), "{note}");
+    assert!(note.contains("3 times"), "{note}");
+    assert!(note.contains("기억해: <rule>"), "{note}");
     h.close().await;
 }
 
+/// An owner correction steered into a running turn is captured too, and the note rides on
+/// the steered text.
 #[tokio::test]
-async fn show_memory_names_the_jev_state_and_the_backlog() {
+async fn a_steered_correction_is_captured_with_its_note() {
     let dir = tempfile::tempdir().unwrap();
-    // jev on without a key: paused with E_JEV_AUTH from the start.
-    let mut jev = MemoryConfig::default().jev;
-    jev.enabled = true;
-    let (h, _memory) = Harness::open(dir.path(), "ok").attach_observer(jev);
-    let mut n = 9800;
-    let mut say = |text: &str| {
-        n += 1;
-        in_thread(&format!("1300000000000{n:06}"), THREAD_A, text)
-    };
-    queued(h.handle(say("hi")).await);
-    h.drain().await;
-    let shown = memory_row(h.handle(say("뭐 기억해?")).await);
-    let reply = h.row(shown).reply.expect("reply");
-    assert_eq!(
-        reply,
-        "Observer: paused (E_JEV_AUTH), 1 waiting\nNothing remembered yet."
+    let (h, memory) = Harness::open_steer(dir.path(), "merged").attach_memory();
+    for (row, text) in [
+        (901, "왜 또 영어로 답해?"),
+        (902, "몇 번 말해, 영어로 답하지 마"),
+    ] {
+        memory
+            .add(moraebot::memory::NewEntry {
+                text: text.into(),
+                prov: moraebot::memory::Prov::Owner,
+                bucket: Bucket::SelfObs,
+                src: moraebot::memory::Source::row(row),
+                expires: None,
+                why: None,
+            })
+            .await
+            .unwrap();
+    }
+    let a = queued(
+        h.handle(in_thread("1300000000000000990", THREAD_A, "A"))
+            .await,
     );
+    let step = h.spawn_step();
+    h.wait_turn(&h.row(a).conversation_key).await;
+    steered(
+        h.handle(in_thread(
+            "1300000000000000991",
+            THREAD_A,
+            "또 그러네, 영어로 답하지 마",
+        ))
+        .await,
+    );
+    assert!(bounded(step).await.unwrap());
+    let prompts = h.prompts();
+    assert_eq!(behavior(&prompts[1]), "steer");
+    let steer = prompts[1]["message"].as_str().unwrap();
+    assert!(steer.contains(moraebot::lessons::NOTE_OPEN), "{steer}");
+    assert!(steer.contains("3 times"), "{steer}");
+    memory
+        .add(moraebot::memory::NewEntry {
+            text: "barrier".into(),
+            prov: moraebot::memory::Prov::Owner,
+            bucket: Bucket::General,
+            src: moraebot::memory::Source::new("test").unwrap(),
+            expires: None,
+            why: None,
+        })
+        .await
+        .unwrap();
+    let saved: Vec<String> = memory
+        .entries(&Bucket::SelfObs)
+        .unwrap()
+        .into_iter()
+        .map(|e| e.text)
+        .collect();
+    assert_eq!(saved.last().unwrap(), "또 그러네, 영어로 답하지 마");
     h.close().await;
 }
 
@@ -5053,178 +4967,6 @@ async fn a_core_save_in_a_replied_turn_leaves_the_reply_alone() {
     assert!(!reply.ends_with('\n'), "nothing is appended: {reply:?}");
 }
 
-// --- Memory jobs (P2 stage 1) ---
-
-impl Harness {
-    /// Every pending memory job of `kind`, oldest first.
-    fn memory_jobs(&self, kind: JobKind) -> Vec<MemoryJob> {
-        self.store
-            .lock()
-            .unwrap()
-            .pending_memory_jobs(100)
-            .unwrap()
-            .jobs
-            .into_iter()
-            .filter(|job| job.kind == kind)
-            .collect()
-    }
-}
-
-fn group_rows(job: &MemoryJob) -> Vec<(i64, String)> {
-    match &job.payload {
-        JobPayload::Group(group) => group
-            .rows
-            .iter()
-            .map(|row| (row.id, row.origin.clone()))
-            .collect(),
-        other => panic!("expected a group job, got {other:?}"),
-    }
-}
-
-fn group_trace(job: &MemoryJob) -> Option<TurnTrace> {
-    match &job.payload {
-        JobPayload::Group(group) => group.trace.clone(),
-        other => panic!("expected a group job, got {other:?}"),
-    }
-}
-
-#[tokio::test]
-async fn memory_job_exists_after_a_reply() {
-    let dir = tempfile::tempdir().unwrap();
-    let h = Harness::open(dir.path(), "ok");
-    let id = queued(h.handle(channel_msg("1300000000000002001", "hello")).await);
-    assert!(h.step().await);
-    assert_eq!(h.row(id).state, State::Done);
-    let jobs = h.memory_jobs(JobKind::Group);
-    assert_eq!(jobs.len(), 1);
-    assert!(!jobs[0].partial);
-    assert_eq!(group_rows(&jobs[0]), [(id, "owner".to_owned())]);
-    assert!(
-        group_trace(&jobs[0]).is_some(),
-        "a settled turn has its trace"
-    );
-    h.close().await;
-}
-
-#[tokio::test]
-async fn memory_job_exists_after_a_failed_turn() {
-    let dir = tempfile::tempdir().unwrap();
-    let h = Harness::open(dir.path(), "error");
-    let id = queued(h.handle(channel_msg("1300000000000002002", "hello")).await);
-    assert!(h.step().await);
-    assert_eq!(h.row(id).state, State::Failed);
-    let jobs = h.memory_jobs(JobKind::Group);
-    assert_eq!(jobs.len(), 1);
-    assert!(jobs[0].partial);
-    assert_eq!(group_rows(&jobs[0]), [(id, "owner".to_owned())]);
-    assert!(group_trace(&jobs[0]).is_some());
-    h.close().await;
-}
-
-#[tokio::test]
-async fn memory_job_exists_after_a_timed_out_turn() {
-    let dir = tempfile::tempdir().unwrap();
-    let config = test_config(dir.path(), PathBuf::from(env!("CARGO_BIN_EXE_fake-omp")));
-    let h = Harness::with_lead(dir.path(), config, "hang", false, Vec::new(), |omp| {
-        omp.with_turn_timeout(Duration::from_secs(1))
-    });
-    let id = queued(h.handle(channel_msg("1300000000000002003", "hello")).await);
-    // The step returns once the group is settled, so the row state is final here.
-    assert!(h.step().await);
-    let row = h.row(id);
-    assert_eq!(row.state, State::NeedsCheck);
-    assert_eq!(row.error.as_deref(), Some(omp::E_TURN_TIMEOUT));
-    let jobs = h.memory_jobs(JobKind::Group);
-    assert_eq!(jobs.len(), 1);
-    assert!(jobs[0].partial);
-    assert_eq!(group_rows(&jobs[0]), [(id, "owner".to_owned())]);
-    assert!(
-        group_trace(&jobs[0]).is_some(),
-        "a timed-out turn keeps its trace"
-    );
-    h.close().await;
-}
-
-#[tokio::test]
-async fn memory_job_exists_after_a_lane_result() {
-    let dir = tempfile::tempdir().unwrap();
-    let h = Harness::open(dir.path(), "ok");
-    let lane = match h
-        .store
-        .lock()
-        .unwrap()
-        .start_lane("toolu_1", LANE_KEY, "t", None, None, MAX_RUNNING_LANES)
-        .unwrap()
-    {
-        LaneStart::New(id) => id,
-        other => panic!("expected a new lane, got {other:?}"),
-    };
-    let input = lead::lane_result(LANE_KEY, lane, &LaneResult::Text("lane done"));
-    assert!(
-        h.store
-            .lock()
-            .unwrap()
-            .finish_lane(lane, 1, &input, LaneState::Idle, None)
-            .unwrap()
-    );
-    let row = h.store.lock().unwrap().count().unwrap();
-    let jobs = h.memory_jobs(JobKind::Lane);
-    assert_eq!(jobs.len(), 1);
-    assert_eq!(
-        jobs[0].payload,
-        JobPayload::Lane(LaneJob { row, lane, seq: 1 })
-    );
-    // The lead turn that reads the result is a group of its own.
-    h.drain().await;
-    let groups = h.memory_jobs(JobKind::Group);
-    assert_eq!(groups.len(), 1);
-    assert_eq!(group_rows(&groups[0]), [(row, "lane".to_owned())]);
-    h.close().await;
-}
-
-#[tokio::test]
-async fn memory_job_of_a_lane_result_turn_lists_the_steered_owner_row() {
-    let dir = tempfile::tempdir().unwrap();
-    let h = Harness::open_steer(dir.path(), "merged");
-    // The owner's thread B is conversation `fake:th:222`; the lane reports there.
-    let key = format!("fake:th:{THREAD_B}");
-    let lane = match h
-        .store
-        .lock()
-        .unwrap()
-        .start_lane("toolu_1", &key, "t", None, None, MAX_RUNNING_LANES)
-        .unwrap()
-    {
-        LaneStart::New(id) => id,
-        other => panic!("expected a new lane, got {other:?}"),
-    };
-    let input = lead::lane_result(&key, lane, &LaneResult::Text("lane done"));
-    assert!(
-        h.store
-            .lock()
-            .unwrap()
-            .finish_lane(lane, 1, &input, LaneState::Idle, None)
-            .unwrap()
-    );
-    let lane_row = h.store.lock().unwrap().count().unwrap();
-    let step = h.spawn_step();
-    h.wait_turn(&key).await;
-    let owner = steered(
-        h.handle(in_thread("1300000000000002005", THREAD_B, "B"))
-            .await,
-    );
-    assert!(bounded(step).await.unwrap());
-    assert_eq!(h.row(owner).steered_into, Some(lane_row));
-    let jobs = h.memory_jobs(JobKind::Group);
-    assert_eq!(jobs.len(), 1);
-    assert!(!jobs[0].partial);
-    assert_eq!(
-        group_rows(&jobs[0]),
-        [(lane_row, "lane".to_owned()), (owner, "owner".to_owned())]
-    );
-    h.close().await;
-}
-
 #[tokio::test]
 async fn a_core_save_of_a_failed_turn_is_not_posted_after_a_restart() {
     let dir = tempfile::tempdir().unwrap();
@@ -5371,7 +5113,7 @@ async fn a_dm_in_a_thread_is_keyed_and_answered_in_that_thread() {
 
     assert_eq!(h.row(id).conversation_key, "fake:th:444:100");
     assert_eq!(h.row(plain).conversation_key, "fake:dm:444");
-    assert_eq!(h.row(id).state, State::Done);
+    assert_eq!(h.row(id).state, State::Done, "{:?}", h.row(id).error);
     assert_eq!(
         h.sends(),
         vec![

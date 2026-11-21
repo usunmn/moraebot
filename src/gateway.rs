@@ -7,27 +7,22 @@
 //! Shutdown order: stop taking events from the adapter, let the event being handled
 //! finish its store write, drop the in-flight turn, stop the lanes, kill and reap the
 //! lead and every lane child, then mark the interrupted rows and lanes `needs_check` so
-//! nothing is re-prompted, then stop the memory observer, and wait until the memory writer
-//! and the inbox released their locks: a detached thread (an observer scan, an omp host tool
-//! call) may still hold the store for a moment after its task was stopped.
-//!
-//! The memory observer ([`Observer`]) runs as its own task beside the dispatcher, not as one
-//! of its supervised tasks: a fault in memory code never stops the gateway.
+//! nothing is re-prompted, and wait until the memory writer and the inbox released their
+//! locks: a detached thread (an omp host tool call) may still hold the store for a moment
+//! after its task was stopped.
 
 use std::future::Future;
 use std::sync::{Arc, Mutex};
 
-use tokio::sync::{Notify, mpsc, oneshot, watch};
+use tokio::sync::{mpsc, watch};
 use tokio::task::JoinError;
 
 use crate::adapter::{AdapterError, MessengerAdapter};
 use crate::config::{Config, ConfigError, RecallMode};
 use crate::dispatch::Dispatcher;
 use crate::hints;
-use crate::jev::{self, Jev};
 use crate::lead;
 use crate::memory::{self, MemoryError, MemoryExit, MemoryHandle, MemoryStore, Redactor};
-use crate::observer::Observer;
 use crate::omp::{OmpManager, lock};
 use crate::omp_overlay::{self, OverlayCheck};
 use crate::onboarding;
@@ -47,8 +42,6 @@ pub const E_SHUTDOWN_TIMEOUT: &str = "E_SHUTDOWN_TIMEOUT";
 const EVENT_QUEUE: usize = 64;
 /// How long shutdown waits for the memory worker and the inbox to release their locks.
 const RELEASE_LIMIT: std::time::Duration = std::time::Duration::from_secs(10);
-/// How long shutdown waits for the memory observer's pass before it aborts it.
-const OBSERVER_STOP_LIMIT: std::time::Duration = std::time::Duration::from_secs(5);
 
 #[derive(Debug, thiserror::Error)]
 pub enum GatewayError {
@@ -91,9 +84,6 @@ pub struct Gateway {
     memory: MemoryHandle,
     memory_exit: MemoryExit,
     omp: OmpManager,
-    observer: Observer,
-    /// Notified by the store after every commit that queued a memory job.
-    memory_wake: Arc<Notify>,
     /// What the start check found about omp (`None` in tests that skip the check).
     omp_check: Option<OverlayCheck>,
 }
@@ -106,18 +96,19 @@ impl Gateway {
     /// old 0.2.0 layout with `E_MEMORY_OLD_LAYOUT`) and starts its writer thread, which
     /// serves the owner's memory commands, and writes the omp overlay the lead and lanes run
     /// with (`E_OMP_OVERLAY` when it cannot); nothing else is started yet. The memory store
-    /// and the observer share one redactor that also hides the jev key.
+    /// and the recall advisor share one redactor. Memory log and recall ledger rows older than
+    /// 30 days are pruned here.
     pub fn open(config: &Config, adapter: Arc<dyn MessengerAdapter>) -> Result<Self, GatewayError> {
         omp_overlay::write_overlay(&config.home)?;
         let guidance = hints::load(&config.home, lead::GUIDANCE_NAME, lead::DEFAULT_GUIDANCE)?;
         let hints = hints::load(&config.home, adapter.platform(), adapter.behavior_hints())?;
-        let store = Arc::new(Mutex::new(Store::open(&config.home.join(STORE_FILE))?));
-        let memory_wake = Arc::new(Notify::new());
-        let wake = Arc::clone(&memory_wake);
-        lock(&store).set_memory_wake(Arc::new(move || wake.notify_one()));
-        let jev_key = config.memory.jev.api_key();
-        let redactor = Redactor::from_config(config)
-            .with_own(jev_key.iter().map(|key| key.expose().to_owned()));
+        let mut inbox = Store::open(&config.home.join(STORE_FILE))?;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs() as i64);
+        inbox.prune_memory(now)?;
+        let store = Arc::new(Mutex::new(inbox));
+        let redactor = Redactor::from_config(config);
         let (memory, memory_exit) = MemoryHandle::spawn_with_exit(MemoryStore::open(
             &config.home,
             redactor.clone(),
@@ -125,14 +116,6 @@ impl Gateway {
         )?)?;
         let advisor = (config.memory.recall_mode() != RecallMode::Off)
             .then(|| Arc::new(Advisor::new(config, Arc::clone(&store), redactor.clone())));
-        let observer = Observer::new(
-            config,
-            Arc::clone(&store),
-            memory.clone(),
-            Arc::new(Jev::new(config.memory.jev.clone(), jev::system_now())),
-            redactor,
-            jev::system_now(),
-        );
         let mut omp = OmpManager::new(config.clone(), Arc::clone(&store))
             .with_hints(lead::system_prompt(&guidance, &hints))
             .with_memory(memory.clone());
@@ -149,24 +132,15 @@ impl Gateway {
             memory,
             memory_exit,
             omp,
-            observer,
-            memory_wake,
             omp_check: None,
         })
     }
 
-    /// Hands over what the start check found about omp: its version goes with every memory
-    /// job the observer settles (`unknown` without this call), and a version warning goes to
-    /// the owner once per version (`N_OMP_VERSION`).
+    /// Hands over what the start check found about omp: a version warning goes to the owner
+    /// once per version (`N_OMP_VERSION`).
     pub fn with_omp_check(mut self, check: &OverlayCheck) -> Self {
-        self.observer = self.observer.with_omp_version(&check.version);
         self.omp_check = Some(check.clone());
         self
-    }
-
-    /// The count of memory jobs the observer has settled. Take it before [`Self::run`].
-    pub fn memory_progress(&self) -> watch::Receiver<u64> {
-        self.observer.progress()
     }
 
     /// Adjusts the omp manager (tests add child environment variables or a turn limit).
@@ -192,23 +166,15 @@ impl Gateway {
             memory,
             memory_exit,
             omp,
-            observer,
-            memory_wake,
             omp_check,
         } = self;
         let mut inbound = adapter.start().await?;
-        let observer = Arc::new(observer);
-        let mut dispatcher = Dispatcher::new(&config, adapter, Arc::clone(&store), omp)
-            .with_memory(memory)
-            .with_observer(Arc::clone(&observer));
+        let mut dispatcher =
+            Dispatcher::new(&config, adapter, Arc::clone(&store), omp).with_memory(memory);
         if let Some(check) = omp_check {
             dispatcher = dispatcher.with_omp_check(check);
         }
         let dispatcher = Arc::new(dispatcher);
-        let (stop_observer, observer_stopped) = oneshot::channel::<()>();
-        let mut observer = tokio::spawn(observer.run(memory_wake, async {
-            let _ = observer_stopped.await;
-        }));
         let (events, queue) = mpsc::channel(EVENT_QUEUE);
         let mut dispatch = tokio::spawn(dispatcher.run(queue));
         tracing::info!("gateway started");
@@ -240,20 +206,10 @@ impl Gateway {
         };
         // A turn that was cut off is still `processing` and a stopped lane `running`:
         // make them `needs_check`.
-        let recovered = lock(&store).recover_on_start();
-        let _ = stop_observer.send(());
-        if tokio::time::timeout(OBSERVER_STOP_LIMIT, &mut observer)
-            .await
-            .is_err()
-        {
-            tracing::warn!("memory observer did not stop in time; aborted");
-            observer.abort();
-            let _ = observer.await;
-        }
-        recovered?;
-        // The dispatcher and the observer held the last memory handles, and the gateway's is the
-        // last store handle it can drop itself; wait for the worker and any detached thread still
-        // holding the store, so the home is free when `run` returns.
+        lock(&store).recover_on_start()?;
+        // The dispatcher held the last memory handles, and the gateway's is the last store
+        // handle it can drop itself; wait for the worker and any detached thread still holding
+        // the store, so the home is free when `run` returns.
         let store_closed = lock(&store).closed();
         drop(store);
         let (memory_released, store_released) = tokio::task::spawn_blocking(move || {

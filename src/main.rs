@@ -210,17 +210,13 @@ fn check_config(env: &Env, config: Option<PathBuf>) -> Result<ExitCode, ConfigEr
         None => env.default_config_path()?,
     };
     let mut stdout = io::stdout().lock();
-    let mut config = match Config::load(&path, env) {
+    let config = match Config::load(&path, env) {
         Ok(config) => config,
         Err(err) => {
             writeln!(stdout, "FAIL config: {err}")?;
             return Ok(ExitCode::FAILURE);
         }
     };
-    config
-        .memory
-        .jev
-        .set_env_key(std::env::var("TYPESAFE_API_KEY").ok());
     let checks_ok = report_checks(&config.checks(), &mut stdout)?;
     if config.messenger == Platform::Bridge
         && let Some(bridge) = &config.bridge
@@ -396,14 +392,17 @@ fn run_gateway(env: &Env, config: Option<PathBuf>) -> Result<ExitCode, Box<dyn s
         Some(path) => path,
         None => env.default_config_path()?,
     };
-    let mut config = Config::load(&path, env)?;
-    config
-        .memory
-        .jev
-        .set_env_key(std::env::var("TYPESAFE_API_KEY").ok());
+    let config = Config::load(&path, env)?;
     config.validate()?;
     memory::check_old_layout(&config.home)?;
     let _log_guard = logging::init(&config.home, logging::CORE_LOG_PREFIX)?;
+    for table in &config.memory.ignored {
+        tracing::warn!(
+            code = moraebot::config::W_CONFIG_IGNORED,
+            table = %table,
+            "config table is no longer used and is ignored; remove it"
+        );
+    }
     let overlay = omp_overlay::check(&config.omp_path, &config.home)?;
     match &overlay.warning {
         Some(warning) => tracing::warn!(omp = %overlay.version, "{warning}"),

@@ -8,32 +8,32 @@
 //! - remember: `기억해: <text>`, `<text> 기억해(줘/둬/놔)`, `remember: <text>`,
 //!   `remember that <text>`. Saved in the conversation's thread bucket; `기억해(<repo>):` /
 //!   `remember(<repo>):` saves in that project's bucket. Only an explicit "always"
-//!   (`항상 기억해`, `always remember`) saves in core, because a core change restarts the
-//!   lead; an "always" rule that says not to do something goes to the boundaries file.
+//!   (`항상 기억해`, `always remember`) saves in core, because core goes into the lead's
+//!   system prompt; an "always" rule that says not to do something goes to the boundaries file.
 //! - show: `뭐 기억해?`, `what do you remember?` (core, boundaries and this conversation),
 //!   or `m-xxxxxx 보여줘` / `show m-xxxxxx` for one entry. `너 자신에 대해 뭐 기억해?` /
-//!   `what do you know about yourself?` lists the self readings and how many corrections wait
-//!   for consolidation. Self readings are shown only on request, never announced (#56, #59).
+//!   `what do you know about yourself?` lists the corrections the owner gave
+//!   (`self/observations.md`, [`crate::lessons`]).
 //! - correct: `m-xxxxxx 고쳐: <new text>`, `correct m-xxxxxx: <new text>`.
 //! - forget: `m-xxxxxx 지워(줘)`, `forget m-xxxxxx`; the dispatcher asks once and acts on the
 //!   owner's next message in that conversation ([`confirmation`]).
 //! - restore: `m-xxxxxx 되살려`, `restore m-xxxxxx`.
+//! - refresh: the whole message `기억 새로고침` / `refresh memory` ([`refresh_request`]); the
+//!   lead's system prompt is set again before its next turn instead of waiting for its prompt
+//!   cache to go cold. The dispatcher answers it like a status question.
+//! - recent recalls: the whole message `최근 떠올린 기억` / `recent recalls`
+//!   ([`recent_recalls_request`]) lists the last [`RECENT_RECALLS`] recall ledger rows with
+//!   each entry's current text.
 //!
 //! A question (`... 기억해?`) is not a remember request, and id commands must be short (at
 //! most [`MAX_ID_COMMAND_WORDS`] words) so a sentence that merely mentions an id and a verb
 //! still goes to the lead.
 //!
-//! A message the rules did not match goes to jev ([`classify`]) only when it holds memory
-//! words or an entry id ([`looks_like_memory_request`]). jev picks the intent and, for a
-//! remember request, the sentence; every other argument comes from the owner's own text
-//! ([`from_intent`]). Any jev error means "not a command", so the rules alone serve the owner
-//! while jev is off, paused, waiting or slow.
+//! A message the rules do not match goes to the lead.
 
-use crate::consolidate;
-use crate::jev::{Answer as JevAnswer, Jev, Question, Request};
 use crate::memory::{
-    self, Bucket, E_MEMORY_ARCHIVED, E_MEMORY_NOT_ARCHIVED, E_MEMORY_NOT_FOUND, Entry, Found,
-    MemoryError, MemoryHandle, NewEntry, Prov, Redactor, Source,
+    Bucket, E_MEMORY_ARCHIVED, E_MEMORY_NOT_ARCHIVED, E_MEMORY_NOT_FOUND, Entry, Found,
+    MemoryError, MemoryHandle, NewEntry, Prov, Source,
 };
 
 /// An id command (show one, forget, restore) has at most this many words.
@@ -61,7 +61,7 @@ pub enum Command {
     },
     /// Core, boundaries and this conversation's entries.
     Show,
-    /// The self readings and the count of pending observations.
+    /// The corrections the owner gave (`self/observations.md`).
     ShowSelf,
     ShowOne(String),
     Correct {
@@ -230,6 +230,95 @@ pub fn confirmation(text: &str) -> Option<bool> {
     }
 }
 
+/// The owner's refresh command: the whole message is `기억 새로고침` or `refresh memory` (case,
+/// spaces and closing punctuation ignored, like the new-session command). Returns the language
+/// it was given in.
+pub fn refresh_request(text: &str) -> Option<crate::status::Lang> {
+    match normalize(text).as_str() {
+        "기억 새로고침" => Some(crate::status::Lang::Korean),
+        "refresh memory" => Some(crate::status::Lang::English),
+        _ => None,
+    }
+}
+
+/// The answer to the refresh command.
+pub fn refresh_text(lang: crate::status::Lang) -> &'static str {
+    match lang {
+        crate::status::Lang::Korean => {
+            "리드가 다음에 턴 사이에서 쉴 때 저장된 기억을 시스템 프롬프트에 다시 반영할게요."
+        }
+        crate::status::Lang::English => {
+            "Saved memory goes into the lead's system prompt again when the lead is next idle between turns."
+        }
+    }
+}
+
+/// How many ledger rows the recent-recalls answer lists.
+pub const RECENT_RECALLS: usize = 10;
+
+/// The owner's recent-recalls command: the whole message is `최근 떠올린 기억` or
+/// `recent recalls` (normalized like [`refresh_request`]). Returns the language it was given in.
+pub fn recent_recalls_request(text: &str) -> Option<crate::status::Lang> {
+    match normalize(text).as_str() {
+        "최근 떠올린 기억" => Some(crate::status::Lang::Korean),
+        "recent recalls" => Some(crate::status::Lang::English),
+        _ => None,
+    }
+}
+
+/// The answer to the recent-recalls command: one line per ledger row of `rows` (newest
+/// first) with its age at `now` (unix seconds), wake phase, state, entry id and the entry's
+/// current text, or `(gone)` when it was forgotten, replaced or removed.
+pub fn recent_recalls(
+    memory: &MemoryHandle,
+    lang: crate::status::Lang,
+    rows: &[crate::store::RecallRow],
+    now: i64,
+) -> String {
+    use crate::status::Lang;
+    use crate::store::{RecallPhase, RecallState};
+    if rows.is_empty() {
+        return match lang {
+            Lang::Korean => "아직 떠올린 기억이 없어요.".into(),
+            Lang::English => "No recalls yet.".into(),
+        };
+    }
+    let mut out = vec![match lang {
+        Lang::Korean => format!("최근 떠올린 기억 {}개 (최신순):", rows.len()),
+        Lang::English => format!("Last {} recalls, newest first:", rows.len()),
+    }];
+    for row in rows {
+        let text = match memory.show(&row.entry_id) {
+            Ok(Some(found)) if !found.archived => found.entry.text,
+            Ok(_) => match lang {
+                Lang::Korean => "(없어짐)".to_owned(),
+                Lang::English => "(gone)".to_owned(),
+            },
+            Err(err) => failure(&row.entry_id, &err),
+        };
+        let (phase, state) = match lang {
+            Lang::English => (row.phase.as_str(), row.state.as_str()),
+            Lang::Korean => (
+                match row.phase {
+                    RecallPhase::Owner => "오너 메시지",
+                    RecallPhase::Mid => "작업 중",
+                },
+                match row.state {
+                    RecallState::Delivered => "전달됨",
+                    RecallState::Rejected => "거절됨",
+                    RecallState::Shadow => "기록만",
+                },
+            ),
+        };
+        out.push(format!(
+            "- {} {phase} {state} {} {text}",
+            crate::status::ago(lang, now - row.at),
+            row.entry_id
+        ));
+    }
+    out.join("\n")
+}
+
 /// The memory id in `word` (`m-` and 6 to 16 lowercase hex digits, maybe a particle after
 /// it), stripped of surrounding punctuation.
 fn id_of(word: &str) -> Option<String> {
@@ -352,81 +441,6 @@ fn strip_always_prefix(text: &str) -> (bool, &str) {
     (false, text)
 }
 
-/// The words of `text`, lowercased: the runs of letters, digits and `_` between every other
-/// character, so "whenever" is one word and "never." holds "never".
-fn words(text: &str) -> Vec<String> {
-    text.to_lowercase()
-        .split(|c: char| !c.is_alphanumeric() && c != '_')
-        .filter(|w| !w.is_empty())
-        .map(str::to_owned)
-        .collect()
-}
-
-/// Whether `text` states a standing rule: `항상` anywhere, `always` as a whole word, the
-/// phrase "from now on", or `앞으로` / `앞으로는` as a whole word.
-pub(crate) fn says_always(text: &str) -> bool {
-    if text.contains("항상") {
-        return true;
-    }
-    let words = words(text);
-    words
-        .iter()
-        .any(|w| matches!(w.as_str(), "always" | "앞으로" | "앞으로는"))
-        || words.windows(3).any(|w| w == ["from", "now", "on"])
-}
-
-/// Whether `text` corrects the bot: it holds one of `patterns` (see [`holds_phrase`]), so
-/// `하지 말라고 했` matches "하지 말라고 했잖아" and `몇 번 말해` does not match "몇 번 버스 타?"
-/// (moraedang on #59 and #65). Case is ignored.
-pub(crate) fn says_correction(text: &str, patterns: &[String]) -> bool {
-    let have = words(text);
-    patterns.iter().any(|pattern| holds_phrase(&have, pattern))
-}
-
-/// Whether the words `have` hold `pattern`: its parts (split at `…` or `...`) in order, any
-/// words between parts, the words of a part next to each other. Each word must be whole, but
-/// the pattern's very last word only has to start a word, so a Korean ending may follow it.
-/// A pattern without words matches nothing.
-fn holds_phrase(have: &[String], pattern: &str) -> bool {
-    let parts: Vec<Vec<String>> = pattern
-        .replace("...", "…")
-        .split('…')
-        .map(words)
-        .filter(|part| !part.is_empty())
-        .collect();
-    let Some(last) = parts.len().checked_sub(1) else {
-        return false;
-    };
-    let mut from = 0;
-    for (i, part) in parts.iter().enumerate() {
-        let fits = |at: usize| {
-            part.iter().enumerate().all(|(k, wanted)| {
-                let word = &have[at + k];
-                if i == last && k == part.len() - 1 {
-                    word.starts_with(wanted.as_str())
-                } else {
-                    word == wanted
-                }
-            })
-        };
-        let end = have.len().saturating_sub(part.len());
-        match (from..=end).find(|&at| at + part.len() <= have.len() && fits(at)) {
-            Some(at) => from = at + part.len(),
-            None => return false,
-        }
-    }
-    true
-}
-
-/// Whether `text` may be a boundary the observer saves without a command: it holds `always`,
-/// `never`, `항상`, `절대` or `절대로` as a whole word. A "don't" alone is no boundary: it is
-/// often meant for one task only.
-pub(crate) fn says_boundary(text: &str) -> bool {
-    words(text)
-        .iter()
-        .any(|w| matches!(w.as_str(), "always" | "never" | "항상" | "절대" | "절대로"))
-}
-
 /// `기억해: <body>`, `기억해(<repo>): <body>`, `remember that <body>`; returns the repo, if
 /// named, and the body.
 fn prefixed(text: &str) -> Option<(Option<String>, &str)> {
@@ -474,210 +488,6 @@ fn remember(body: &str, always: bool, repo: Option<String>) -> Option<Command> {
     })
 }
 
-/// Words that make a message worth asking jev about. Verbs such as `지워`, `delete` or `fix`
-/// count only together with an entry id: alone they are ordinary coding requests.
-const MEMORY_WORDS: [&str; 7] = [
-    "기억", "잊어", "잊지", "remember", "forget", "memory", "memories",
-];
-
-/// The distinct entry ids in `text`, in order.
-fn ids_in(text: &str) -> Vec<String> {
-    let mut ids: Vec<String> = Vec::new();
-    for id in text.split_whitespace().filter_map(id_of) {
-        if !ids.contains(&id) {
-            ids.push(id);
-        }
-    }
-    ids
-}
-
-/// Whether an owner message the rules did not match may still be a memory request: it holds
-/// an entry id or one of [`MEMORY_WORDS`] (case ignored).
-pub fn looks_like_memory_request(text: &str) -> bool {
-    let lower = text.to_lowercase();
-    !ids_in(&lower).is_empty() || MEMORY_WORDS.iter().any(|word| lower.contains(word))
-}
-
-/// What jev says an owner message asks of the memory store.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Intent {
-    Remember,
-    Show,
-    Correct,
-    Forget,
-    Restore,
-}
-
-/// The `intent` options, in wire order; `none` last.
-const INTENTS: [(&str, &str, Option<Intent>); 6] = [
-    (
-        "remember",
-        "Save something new in the assistant's memory.",
-        Some(Intent::Remember),
-    ),
-    (
-        "show",
-        "Show what the assistant remembers, or one saved entry.",
-        Some(Intent::Show),
-    ),
-    (
-        "correct",
-        "Replace a saved entry with new text.",
-        Some(Intent::Correct),
-    ),
-    (
-        "forget",
-        "Delete or forget a saved entry.",
-        Some(Intent::Forget),
-    ),
-    (
-        "restore",
-        "Bring back a forgotten entry.",
-        Some(Intent::Restore),
-    ),
-    ("none", "None of these.", None),
-];
-
-const REQUEST_QUESTION: &str = "Is the owner asking the assistant to save, show, change, delete \
-     or restore something in its own saved memory?";
-const REQUEST_YES: &str = "The owner asks for a change to, or a look at, the assistant's own saved \
-     memory.";
-const REQUEST_NO: &str = "The owner asks for other work, asks a question about the past, or only \
-     mentions memory in passing.";
-const INTENT_QUESTION: &str = "What does the owner want done with the assistant's memory?";
-const SPAN_QUESTION: &str = "Which one sentence is the thing to remember?";
-
-/// The command for jev's `intent`, with every argument taken from the owner's `text`; `span`
-/// is the whole sentence jev picked to remember. `None` when an argument is missing: the
-/// message then goes to the lead.
-pub fn from_intent(intent: Intent, text: &str, span: Option<&str>) -> Option<Command> {
-    let ids = ids_in(text);
-    let one = match ids.as_slice() {
-        [id] => Some(id.clone()),
-        _ => None,
-    };
-    match intent {
-        Intent::Show => Some(one.map_or(Command::Show, Command::ShowOne)),
-        Intent::Forget => one.map(Command::Forget),
-        Intent::Restore => one.map(Command::Restore),
-        Intent::Correct => {
-            let id = one?;
-            let rest: Vec<String> = memory::own_sentences(text)
-                .into_iter()
-                .map(|(_, sentence)| sentence)
-                .filter(|sentence| ids_in(sentence).is_empty())
-                .collect();
-            (!rest.is_empty()).then(|| Command::Correct {
-                id,
-                text: rest.join(" "),
-            })
-        }
-        Intent::Remember => {
-            let span = span.map(str::trim).filter(|s| !s.is_empty())?;
-            let target = match (says_always(text), says_dont(span)) {
-                (true, true) => Target::Boundaries,
-                (true, false) => Target::Core,
-                (false, _) => Target::Conversation,
-            };
-            Some(Command::Remember {
-                text: span.to_owned(),
-                target,
-            })
-        }
-    }
-}
-
-/// The jev request for owner message sentences `sentences` (`own_sentences` numbering).
-fn classify_request(model: &str, sentences: &[(u32, String)]) -> Request {
-    let mut span: Vec<(String, String)> = sentences
-        .iter()
-        .map(|(n, _)| (format!("s{n}"), format!("Sentence s{n}.")))
-        .collect();
-    span.push((
-        "none".into(),
-        "No sentence is something to remember.".into(),
-    ));
-    Request {
-        model: model.to_owned(),
-        state: serde_json::json!({
-            "kind": "owner_message",
-            "sentences": sentences.iter().map(|(n, s)| format!("s{n}: {s}")).collect::<Vec<_>>(),
-        }),
-        questions: vec![
-            (
-                "request".into(),
-                Question::Noul {
-                    instructions: REQUEST_QUESTION.into(),
-                    yes: REQUEST_YES.into(),
-                    no: REQUEST_NO.into(),
-                },
-            ),
-            (
-                "intent".into(),
-                Question::Choice {
-                    instructions: INTENT_QUESTION.into(),
-                    options: INTENTS
-                        .iter()
-                        .map(|(name, text, _)| ((*name).to_owned(), (*text).to_owned()))
-                        .collect(),
-                },
-            ),
-            (
-                "span".into(),
-                Question::Choice {
-                    instructions: SPAN_QUESTION.into(),
-                    options: span,
-                },
-            ),
-        ],
-    }
-}
-
-/// Asks jev whether owner message `text` is a memory request: one call with the classify
-/// timeout, no retry; a timeout leaves jev's gate as it was ([`Jev::ask_quick`]). The sentences the redactor would change are not sent. `None` on any jev
-/// error, below `classify_threshold`, on intent `none`, or when [`from_intent`] finds an
-/// argument missing.
-pub async fn classify(jev: &Jev, redactor: &Redactor, text: &str) -> Option<Command> {
-    let sentences: Vec<(u32, String)> = memory::own_sentences(text)
-        .into_iter()
-        .filter(|(_, sentence)| !redactor.redact(sentence).1)
-        .collect();
-    if sentences.is_empty() {
-        return None;
-    }
-    let config = jev.config();
-    let request = classify_request(&config.model, &sentences);
-    let response = match jev.ask_quick(&request, config.classify_timeout()).await {
-        Ok(response) => response,
-        Err(err) => {
-            tracing::info!(error = %err, "memory request not classified; rules only");
-            return None;
-        }
-    };
-    let choice = |name: &str| match response.answers.get(name) {
-        Some(JevAnswer::Choice { choice, .. }) => Some(choice.as_str()),
-        _ => None,
-    };
-    let asked = match response.answers.get("request") {
-        Some(JevAnswer::Noul { noul }) => *noul,
-        _ => 0.0,
-    };
-    if asked < config.classify_threshold {
-        return None;
-    }
-    let intent = INTENTS
-        .iter()
-        .find(|(name, _, _)| choice("intent") == Some(*name))
-        .and_then(|(_, _, intent)| *intent)?;
-    let span = choice("span").and_then(|picked| {
-        sentences
-            .iter()
-            .find(|(n, _)| picked == format!("s{n}"))
-            .map(|(_, sentence)| sentence.as_str())
-    });
-    from_intent(intent, text, span)
-}
-
 /// Whether a rule says not to do something.
 pub(crate) fn says_dont(text: &str) -> bool {
     let lower = text.to_lowercase();
@@ -712,17 +522,14 @@ pub fn bucket_for(target: &Target, key: &str) -> Bucket {
 
 fn place(bucket: &Bucket) -> String {
     match bucket {
-        Bucket::Owner => "always (core rules; the lead restarts before its next turn)".into(),
+        Bucket::Owner => "always (core rules; the lead gets it with its next message)".into(),
         Bucket::Boundaries => {
-            "always, as something not to do (core; the lead restarts before its next turn)".into()
+            "always, as something not to do (core; the lead gets it with its next message)".into()
         }
         Bucket::Project(repo) => format!("project {repo}"),
         Bucket::General => "general notes".into(),
         Bucket::Thread(_) => "this conversation".into(),
-        Bucket::SelfObs => "a correction of me, waiting for consolidation".into(),
-        Bucket::SelfModel => {
-            "how I look from outside (self; the lead restarts before its next turn)".into()
-        }
+        Bucket::SelfObs => "a correction you gave me".into(),
     }
 }
 
@@ -775,14 +582,8 @@ impl Answer {
 }
 
 /// Runs `command` from owner row `row_id` of conversation `key`. Forget only asks (see
-/// [`forget`]). `status` (the observer's state, may be empty) heads the full listing.
-pub async fn run(
-    memory: &MemoryHandle,
-    key: &str,
-    row_id: i64,
-    status: &str,
-    command: Command,
-) -> Answer {
+/// [`forget`]).
+pub async fn run(memory: &MemoryHandle, key: &str, row_id: i64, command: Command) -> Answer {
     match command {
         Command::Remember { text, target } => {
             let entry = NewEntry {
@@ -808,7 +609,7 @@ pub async fn run(
                 Err(err) => failure("the entry", &err),
             })
         }
-        Command::Show => Answer::say(show_all(memory, key, status)),
+        Command::Show => Answer::say(list_all(memory, key)),
         Command::ShowSelf => Answer::say(show_self(memory)),
         Command::ShowOne(id) => Answer::say(match memory.show(&id) {
             Ok(Some(found)) => found_line(&found),
@@ -856,33 +657,19 @@ pub async fn forget(memory: &MemoryHandle, id: &str, yes: bool) -> String {
     }
 }
 
-/// `status` as the first line when not empty, then core, boundaries and conversation `key`'s
-/// entries, with their ids.
-fn show_all(memory: &MemoryHandle, key: &str, status: &str) -> String {
-    let listing = list_all(memory, key);
-    if status.is_empty() {
-        listing
-    } else {
-        format!("{status}\n{listing}")
-    }
-}
-
-/// The live self readings with their ids, then how many observations no reading names yet.
+/// The corrections the owner gave (`self/observations.md`) with their ids, newest last.
 fn show_self(memory: &MemoryHandle) -> String {
-    // The same offer consolidation makes, so "waiting" counts what it will still be offered.
-    let offer = consolidate::offer(&memory::self_state(memory.root()), memory.today());
-    let readings = &offer.readings;
-    let pending = offer.pending.len();
-    let mut out = Vec::new();
-    if readings.is_empty() {
-        out.push("No readings about myself yet.".to_owned());
-    } else {
-        out.push("How I look from outside (readings to test, not rules):".to_owned());
-        out.extend(readings.iter().map(entry_line));
+    let entries = match memory.entries(&Bucket::SelfObs) {
+        Ok(entries) => entries,
+        Err(err) => return failure("this list", &err),
+    };
+    if entries.is_empty() {
+        return "No corrections recorded yet.".into();
     }
-    out.push(format!("Corrections waiting for consolidation: {pending}."));
+    let mut out = vec!["Corrections you gave me (your own words):".to_owned()];
+    out.extend(entries.iter().map(entry_line));
     out.push(
-        "Say \"m-xxxxxx 지워\" / \"forget m-xxxxxx\" to forget, \"m-xxxxxx 고쳐: <new text>\" to correct."
+        "Say \"m-xxxxxx 지워\" / \"forget m-xxxxxx\" to forget one, or \"기억해: <rule>\" to keep a standing rule."
             .into(),
     );
     out.join("\n")
@@ -1032,6 +819,21 @@ mod tests {
     }
 
     #[test]
+    fn only_the_whole_refresh_phrase_is_the_refresh_command() {
+        use crate::status::Lang;
+        assert_eq!(refresh_request("기억 새로고침"), Some(Lang::Korean));
+        assert_eq!(refresh_request("  Refresh   memory! "), Some(Lang::English));
+        for text in [
+            "refresh memory please",
+            "기억 새로고침 해줘",
+            "refresh",
+            "memory",
+        ] {
+            assert_eq!(refresh_request(text), None, "{text}");
+        }
+    }
+
+    #[test]
     fn confirmation_words() {
         assert_eq!(confirmation("응"), Some(true));
         assert_eq!(confirmation("Yes!"), Some(true));
@@ -1062,7 +864,7 @@ mod tests {
         let key = "discord:th:111";
         let run_text = |text: &str| parse(text).expect("a command");
 
-        let saved = run(&memory, key, 7, "", run_text("회의는 3시 기억해줘")).await;
+        let saved = run(&memory, key, 7, run_text("회의는 3시 기억해줘")).await;
         assert!(saved.reply.starts_with("Remembered m-"), "{}", saved.reply);
         let id = memory
             .entries(&Bucket::Thread(key.into()))
@@ -1071,20 +873,13 @@ mod tests {
             .clone();
         assert!(memory.entries(&Bucket::Owner).expect("core").is_empty());
 
-        let shown = run(&memory, key, 8, "", Command::Show).await.reply;
+        let shown = run(&memory, key, 8, Command::Show).await.reply;
         assert!(
             shown.contains(&id) && shown.contains("회의는 3시"),
             "{shown}"
         );
 
-        let fixed = run(
-            &memory,
-            key,
-            9,
-            "",
-            run_text(&format!("{id} 고쳐: 회의는 4시")),
-        )
-        .await;
+        let fixed = run(&memory, key, 9, run_text(&format!("{id} 고쳐: 회의는 4시"))).await;
         assert!(fixed.reply.starts_with(&format!("Replaced {id} with m-")));
         let new_id = memory
             .entries(&Bucket::Thread(key.into()))
@@ -1092,7 +887,7 @@ mod tests {
             .id
             .clone();
 
-        let asked = run(&memory, key, 10, "", run_text(&format!("{new_id} 지워"))).await;
+        let asked = run(&memory, key, 10, run_text(&format!("{new_id} 지워"))).await;
         assert_eq!(asked.confirm_forget.as_deref(), Some(new_id.as_str()));
         assert!(
             !memory
@@ -1113,220 +908,14 @@ mod tests {
                 .is_empty()
         );
 
-        let back = run(&memory, key, 11, "", Command::Restore(new_id.clone())).await;
+        let back = run(&memory, key, 11, Command::Restore(new_id.clone())).await;
         assert!(back.reply.starts_with("Restored"), "{}", back.reply);
         assert_eq!(
-            run(&memory, key, 12, "", Command::Forget("m-ffffff".into()))
+            run(&memory, key, 12, Command::Forget("m-ffffff".into()))
                 .await
                 .reply,
             "No memory entry m-ffffff."
         );
-    }
-
-    #[test]
-    fn looks_like_memory_request_needs_memory_words_or_an_id() {
-        for text in [
-            "그 얘기 기억해 둘래?",
-            "Please keep this in your memory",
-            "아까 그거 잊어버리면 안 돼",
-            "m-1f3a2b 이제 필요 없어",
-            "FORGET the deploy rule",
-        ] {
-            assert!(looks_like_memory_request(text), "{text}");
-        }
-        for text in [
-            "이 파일 지워줘",
-            "delete the old branch",
-            "fix the failing test",
-            "PR 고쳐줘",
-            "",
-        ] {
-            assert!(!looks_like_memory_request(text), "{text}");
-        }
-    }
-
-    #[test]
-    fn from_intent_takes_every_argument_from_the_owners_text() {
-        let text = "m-1f3a2b 그거 이제 틀렸어. 회의는 4시야.";
-        assert_eq!(
-            from_intent(Intent::Correct, text, None),
-            Some(Command::Correct {
-                id: "m-1f3a2b".into(),
-                text: "회의는 4시야.".into()
-            })
-        );
-        assert_eq!(
-            from_intent(Intent::Forget, "m-1f3a2b 이제 필요 없어", None),
-            Some(Command::Forget("m-1f3a2b".into()))
-        );
-        assert_eq!(
-            from_intent(Intent::Restore, "m-0c4d5e 다시 살려 놔", None),
-            Some(Command::Restore("m-0c4d5e".into()))
-        );
-        assert_eq!(
-            from_intent(Intent::Show, "m-0c4d5e 내용이 뭐였지", None),
-            Some(Command::ShowOne("m-0c4d5e".into()))
-        );
-        assert_eq!(
-            from_intent(Intent::Show, "내가 말한 거 뭐 남아 있어", None),
-            Some(Command::Show)
-        );
-        // An argument jev cannot supply is missing: the message goes to the lead.
-        assert_eq!(from_intent(Intent::Forget, "그거 잊어줘", None), None);
-        assert_eq!(
-            from_intent(Intent::Restore, "m-1f3a2b m-0c4d5e 살려", None),
-            None
-        );
-        assert_eq!(
-            from_intent(Intent::Correct, "m-1f3a2b 고쳐줘", None),
-            None,
-            "no sentence without the id"
-        );
-        assert_eq!(
-            from_intent(Intent::Remember, "이거 기억해 둘래", None),
-            None
-        );
-        // The remember text is the picked sentence, whole, as the owner wrote it.
-        assert_eq!(
-            from_intent(
-                Intent::Remember,
-                "오늘 고마웠어. 배포는 금요일에 안 해. 잘 자",
-                Some("배포는 금요일에 안 해.")
-            ),
-            Some(Command::Remember {
-                text: "배포는 금요일에 안 해.".into(),
-                target: Target::Conversation
-            })
-        );
-    }
-
-    #[test]
-    fn a_classified_remember_goes_to_core_only_with_always() {
-        let target = |text: &str, span: &str| match from_intent(Intent::Remember, text, Some(span))
-        {
-            Some(Command::Remember { target, .. }) => target,
-            other => panic!("expected Remember, got {other:?}"),
-        };
-        assert_eq!(
-            target(
-                "존댓말로 답해줘, 이거 꼭 기억해",
-                "존댓말로 답해줘, 이거 꼭 기억해"
-            ),
-            Target::Conversation
-        );
-        assert_eq!(
-            target(
-                "앞으로 항상 존댓말로 답해. 기억해 둬",
-                "앞으로 항상 존댓말로 답해."
-            ),
-            Target::Core
-        );
-        assert_eq!(
-            target(
-                "Keep this in memory. Always answer in Korean.",
-                "Always answer in Korean."
-            ),
-            Target::Core
-        );
-        assert_eq!(
-            target(
-                "기억해 둬. 금요일엔 배포하지 마. 항상이야",
-                "금요일엔 배포하지 마."
-            ),
-            Target::Boundaries
-        );
-        assert_eq!(
-            target(
-                "remember: the alwayson flag stays",
-                "the alwayson flag stays"
-            ),
-            Target::Conversation,
-            "always only as a whole word"
-        );
-    }
-
-    /// moraedang on #46: "from now on" and "앞으로" state a standing rule, as the docs and jev's
-    /// own `core` option text say; each only as a whole phrase or word.
-    #[test]
-    fn from_now_on_states_a_standing_rule() {
-        for text in [
-            "From now on, reply in English.",
-            "Reply in English from now on.",
-            "앞으로는 PR을 영어로 올려.",
-            "앞으로 답은 짧게 해줘.",
-        ] {
-            assert!(says_always(text), "{text}");
-        }
-        for text in [
-            "Move it from nowhere onward.",
-            "Read it from now, only once.",
-            "PR을 영어로 올려.",
-        ] {
-            assert!(!says_always(text), "{text}");
-        }
-    }
-
-    /// moraedang on #46: a boundary word is a whole word, so "never" at a sentence's end
-    /// counts and "whenever" or a plain "don't" does not.
-    #[test]
-    fn boundary_words_are_whole_words() {
-        for text in [
-            "Push to main: never.",
-            "Never force-push to main.",
-            "Always run the tests first.",
-            "금요일엔 절대 배포하지 마.",
-            "항상 테스트부터 돌려.",
-        ] {
-            assert!(says_boundary(text), "{text}");
-        }
-        for text in [
-            "Whenever you're unsure, ask me.",
-            "Don't add emoji in this PR.",
-            "이번엔 배포하지 마.",
-        ] {
-            assert!(!says_boundary(text), "{text}");
-        }
-    }
-
-    /// moraedang on #59: correction phrases match as whole words in order, so "몇 번째" is
-    /// no "몇 번".
-    #[test]
-    fn correction_phrases_are_whole_words_in_order() {
-        let patterns = crate::config::SelfConfig::default().correction_patterns;
-        for text in [
-            "몇 번 말해야 돼",
-            "이거 몇 번을 말해야 알아들어?",
-            "몇 번째 말하는 거야",
-            "왜 또 영어로 답해?",
-            "또 그러네",
-            "그러지 마 진짜",
-            "그건 하지 말라고 했잖아",
-            "I told you to run the tests first.",
-            "Why did you push to main again?",
-            "Please STOP DOING that.",
-            "Don't do that again.",
-        ] {
-            assert!(says_correction(text, &patterns), "{text}");
-        }
-        // moraedang on #65: neutral questions that bare `몇 번` or `why did you` caught.
-        for text in [
-            "몇 번 출구야?",
-            "몇 번 버스 타?",
-            "PR 몇 번이야?",
-            "몇 번 했어?",
-            "why did you pick serde here?",
-            "몇 번째 줄이야?",
-            "또 왜 그래",
-            "a nonstop doing",
-        ] {
-            assert!(!says_correction(text, &patterns), "{text}");
-        }
-        assert!(!says_correction("anything", &[]));
-        assert!(!says_correction("anything", &["…".to_owned()]));
-        // `...` is the same gap as `…`, and the gap keeps the parts' order.
-        let gap = ["why did you ... again".to_owned()];
-        assert!(says_correction("why did you do it again", &gap));
-        assert!(!says_correction("again, why did you do it", &gap));
     }
 
     #[test]
@@ -1341,85 +930,103 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn show_self_lists_live_readings_and_counts_pending_corrections() {
+    async fn show_self_lists_the_recorded_corrections() {
         let dir = tempfile::tempdir().expect("tempdir");
         let today = Day::from_ymd(2026, 11, 21).expect("day");
-        let clock = Arc::new(std::sync::Mutex::new(today.plus_days(-40)));
-        let read = Arc::clone(&clock);
-        let store = MemoryStore::open(
-            dir.path(),
-            Redactor::default(),
-            Arc::new(move || *read.lock().expect("clock")),
-        )
-        .expect("open");
+        let store = MemoryStore::open(dir.path(), Redactor::default(), Arc::new(move || today))
+            .expect("open");
         let memory = MemoryHandle::spawn(store).expect("spawn");
-        // moraedang on #65: a correction older than 30 days is never offered again, so it
-        // does not count as waiting.
-        memory
+        let empty = run(&memory, "k", 1, Command::ShowSelf).await.reply;
+        assert_eq!(empty, "No corrections recorded yet.");
+
+        let added = memory
             .add(NewEntry {
-                text: "I was slow".into(),
+                text: "왜 또 영어로 답해?".into(),
                 prov: Prov::Owner,
                 bucket: Bucket::SelfObs,
-                src: Source::observation(9, 0, 9, false),
+                src: Source::row(7),
                 expires: None,
                 why: None,
             })
             .await
             .expect("add");
-        *clock.lock().expect("clock") = today;
-        let empty = run(&memory, "k", 1, "", Command::ShowSelf).await.reply;
-        assert!(
-            empty.starts_with(
-                "No readings about myself yet.\nCorrections waiting for consolidation: 0."
-            ),
-            "{empty}"
-        );
-
-        let mut ids = Vec::new();
-        for (row, text) in [(1, "I answered in English"), (2, "I pushed to main")] {
-            let added = memory
-                .add(NewEntry {
-                    text: text.into(),
-                    prov: Prov::Owner,
-                    bucket: Bucket::SelfObs,
-                    src: Source::observation(row, 0, row, false),
-                    expires: None,
-                    why: None,
-                })
-                .await
-                .expect("add");
-            ids.push(added.id);
-        }
-        let reading = |text: &str, expires: Day| NewEntry {
-            text: text.into(),
-            prov: Prov::Owner,
-            bucket: Bucket::SelfModel,
-            src: Source::reading(&ids[..1]).expect("source"),
-            expires: Some(expires),
-            why: None,
-        };
-        let live = memory
-            .add(reading(
-                "I reply in English; Korean is wanted",
-                today.plus_days(10),
-            ))
-            .await
-            .expect("add");
-        memory
-            .add(reading("an expired reading", today.plus_days(-1)))
-            .await
-            .expect("add");
-
-        let shown = run(&memory, "k", 3, "", Command::ShowSelf).await.reply;
-        assert!(shown.contains(&live.id), "{shown}");
-        assert!(!shown.contains("an expired reading"), "{shown}");
-        assert!(
-            shown.contains("Corrections waiting for consolidation: 1."),
-            "{shown}"
-        );
-        let one = run(&memory, "k", 4, "", Command::ShowOne(live.id.clone()))
+        let shown = run(&memory, "k", 3, Command::ShowSelf).await.reply;
+        assert!(shown.contains(&added.id), "{shown}");
+        assert!(shown.contains("왜 또 영어로 답해?"), "{shown}");
+        let one = run(&memory, "k", 4, Command::ShowOne(added.id.clone()))
             .await
             .reply;
-        assert!(one.contains("how I look from outside"), "{one}");
+        assert!(one.contains("a correction you gave me"), "{one}");
+    }
+
+    #[tokio::test]
+    async fn recent_recalls_lists_ledger_rows_with_entry_text() {
+        use crate::status::Lang;
+        use crate::store::{RecallPhase, RecallRow, RecallState, Store};
+
+        assert_eq!(
+            recent_recalls_request("Recent recalls?"),
+            Some(Lang::English)
+        );
+        assert_eq!(
+            recent_recalls_request("최근 떠올린 기억"),
+            Some(Lang::Korean)
+        );
+        assert_eq!(recent_recalls_request("show recent recalls please"), None);
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let today = Day::from_ymd(2026, 11, 22).expect("day");
+        let store = MemoryStore::open(
+            &dir.path().join("memory"),
+            Redactor::default(),
+            Arc::new(move || today),
+        )
+        .expect("open");
+        let memory = MemoryHandle::spawn(store).expect("spawn");
+        let added = memory
+            .add(NewEntry {
+                text: "deploys go through make release".into(),
+                prov: Prov::Owner,
+                bucket: Bucket::General,
+                src: Source::row(3),
+                expires: None,
+                why: None,
+            })
+            .await
+            .expect("add");
+        let mut ledger = Store::open(&dir.path().join("inbox.sqlite")).expect("store");
+        let row = |id: &str, state, at, phase| RecallRow {
+            conversation: "k".into(),
+            entry_id: id.into(),
+            entry_hash: String::new(),
+            state,
+            lead_generation: 2,
+            lead_epoch: 0,
+            row_id: Some(9),
+            at,
+            phase,
+        };
+        ledger
+            .record_recall(&[
+                row(&added.id, RecallState::Delivered, 1000, RecallPhase::Owner),
+                row("m-abcdef", RecallState::Shadow, 1600, RecallPhase::Mid),
+            ])
+            .expect("ledger");
+        let rows = ledger.recent_recalls(RECENT_RECALLS).expect("rows");
+        let text = recent_recalls(&memory, Lang::English, &rows, 1660);
+        assert_eq!(
+            text,
+            format!(
+                "Last 2 recalls, newest first:\n- 1 min ago mid shadow m-abcdef (gone)\n\
+                 - 11 min ago owner delivered {} deploys go through make release",
+                added.id
+            )
+        );
+        let text = recent_recalls(&memory, Lang::Korean, &rows, 1660);
+        assert!(
+            text.contains("작업 중 기록만 m-abcdef (없어짐)")
+                && text.contains("오너 메시지 전달됨"),
+            "{text}"
+        );
     }
 }

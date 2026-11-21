@@ -38,6 +38,11 @@ pub const E_IO: &str = "E_IO";
 pub const W_ALLOWLIST: &str = "W_ALLOWLIST";
 /// Advisory only: bots are listed and `max_bot_replies` is unset, so bot chats have no cap.
 pub const W_BOT_REPLIES: &str = "W_BOT_REPLIES";
+/// Advisory only: config.toml holds a table moraebot no longer reads (`[memory.jev]`); it is
+/// ignored.
+pub const W_CONFIG_IGNORED: &str = "W_CONFIG_IGNORED";
+/// The removed jev table, still accepted in old files.
+const JEV_TABLE: &str = "[memory.jev]";
 
 /// The window that `max_bot_replies` counts replies in, per thread.
 pub const BOT_REPLY_WINDOW_MINUTES: u64 = 10;
@@ -266,11 +271,18 @@ impl OmpConfig {
 /// busy note, when `lead.handoff_after_minutes` is left out.
 pub const DEFAULT_HANDOFF_AFTER: Duration = Duration::from_secs(5 * 60);
 
-/// `[lead]`: how moraebot nudges a lead turn that keeps the owner waiting.
+/// How long the lead keeps its pinned system prompt after its last turn ended, when
+/// `lead.cache_minutes` is left out.
+pub const DEFAULT_CACHE_WINDOW: Duration = Duration::from_secs(60 * 60);
+
+/// `[lead]`: how moraebot nudges a lead turn that keeps the owner waiting, and how long the
+/// lead keeps its pinned system prompt.
 #[derive(Debug, Clone, Default)]
 pub struct LeadConfig {
     /// Absent means [`DEFAULT_HANDOFF_AFTER`]; `0` turns the busy note off.
     pub handoff_after_minutes: Option<u64>,
+    /// Absent means [`DEFAULT_CACHE_WINDOW`]; `0` restarts the lead on any memory change.
+    pub cache_minutes: Option<u64>,
     /// Absent means `true`: moraebot answers owner status questions itself.
     pub direct_status: Option<bool>,
 }
@@ -281,6 +293,18 @@ impl LeadConfig {
     pub fn handoff_after(&self) -> Option<Duration> {
         match self.handoff_after_minutes {
             None => Some(DEFAULT_HANDOFF_AFTER),
+            Some(0) => None,
+            Some(minutes) => Some(Duration::from_secs(minutes.saturating_mul(60))),
+        }
+    }
+
+    /// How long the lead may sit idle and still keep the system prompt it started with: a
+    /// memory or persona change then reaches it as an update block in its next input, and the
+    /// prompt is set again only once the lead was idle this long (the provider's prompt cache
+    /// is cold by then). `None` (`cache_minutes = 0`) restarts the lead on any change.
+    pub fn cache_window(&self) -> Option<Duration> {
+        match self.cache_minutes {
+            None => Some(DEFAULT_CACHE_WINDOW),
             Some(0) => None,
             Some(minutes) => Some(Duration::from_secs(minutes.saturating_mul(60))),
         }
@@ -316,7 +340,9 @@ impl fmt::Debug for Secret {
 /// The `[memory]` settings.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct MemoryConfig {
-    pub jev: JevConfig,
+    /// Tables in the file moraebot no longer reads (`[memory.jev]`), reported as
+    /// [`W_CONFIG_IGNORED`].
+    pub ignored: Vec<String>,
     pub filter: FilterConfig,
     /// `[memory.self]`.
     pub self_file: SelfConfig,
@@ -325,28 +351,22 @@ pub struct MemoryConfig {
 }
 
 impl MemoryConfig {
-    /// The recall advisor's mode: `memory.recall.mode` when set, else `shadow` only with jev
-    /// turned on and `memory.recall.model` set, and `off` otherwise. So an upgraded install never
-    /// starts an advisor child on the lead's (default) model unasked (moraedang on #66); an
-    /// explicit `mode = "shadow"` without a model still runs on omp's default model.
+    /// The recall advisor's mode: `memory.recall.mode` when set, else `on` (the Kibitzer
+    /// default: an install runs the advisor on `memory.recall.model`, `@smol` unless set).
     pub fn recall_mode(&self) -> RecallMode {
-        self.recall
-            .mode
-            .unwrap_or(if self.jev.enabled && self.recall_model().is_some() {
-                RecallMode::Shadow
-            } else {
-                RecallMode::Off
-            })
+        self.recall.mode.unwrap_or(RecallMode::On)
     }
 
     /// What the advisor does while a lead turn runs: `memory.recall.mid_task` when set, else
-    /// `off`, so no install gains mid-task advisor calls without a config edit; always `off`
-    /// when the advisor itself is off. `on` loads only with `mode = "on"`.
+    /// the advisor's own mode (`on` with `mode = "on"`, `shadow` with `mode = "shadow"`);
+    /// always `off` when the advisor itself is off. `on` loads only with `mode = "on"`.
     pub fn recall_mid_task(&self) -> MidTask {
-        if self.recall_mode() == RecallMode::Off {
-            return MidTask::Off;
+        match (self.recall_mode(), self.recall.mid_task) {
+            (RecallMode::Off, _) => MidTask::Off,
+            (_, Some(mid)) => mid,
+            (RecallMode::On, None) => MidTask::On,
+            (RecallMode::Shadow, None) => MidTask::Shadow,
         }
-        self.recall.mid_task.unwrap_or(MidTask::Off)
     }
 
     /// `memory.recall.model`, or `None` when it is empty (omp's default model then).
@@ -355,11 +375,9 @@ impl MemoryConfig {
         (!model.is_empty()).then_some(model)
     }
 
-    /// Whether the self file runs: `[memory.self] enabled` and jev turned on. With jev off
-    /// (the default) moraebot records no correction, runs no consolidation and adds no self
-    /// block, so a default install starts no summarizer child for it (moraedang on #65).
+    /// Whether owner corrections are captured: `[memory.self] enabled`.
     pub fn self_file_on(&self) -> bool {
-        self.self_file.enabled && self.jev.enabled
+        self.self_file.enabled
     }
 }
 
@@ -373,7 +391,7 @@ pub enum RecallMode {
     Shadow,
     /// The advisor runs before each owner turn, which waits for it at most `wait_ms`; its picks
     /// go into the lead's input as a guarded memory block (late ones with the conversation's
-    /// next owner message). Never the default: only an explicit `mode = "on"`.
+    /// next owner message). The default.
     On,
 }
 
@@ -434,15 +452,13 @@ impl MidTask {
     }
 }
 
-/// The `[memory.recall]` settings: the recall advisor (#59) and the model of self
-/// consolidation.
+/// The `[memory.recall]` settings: the recall advisor (#59).
 #[derive(Debug, Clone, PartialEq)]
 pub struct RecallConfig {
-    /// `None`: `shadow` when jev is on and `model` is set, `off` otherwise
-    /// ([`MemoryConfig::recall_mode`]).
+    /// `None`: `on` ([`MemoryConfig::recall_mode`]).
     pub mode: Option<RecallMode>,
-    /// The omp model of the advisor and of self consolidation (`--model`); empty is omp's
-    /// default model.
+    /// The omp model of the advisor (`--model`); an omp model role such as `@smol` (the
+    /// default) or a model name; empty is omp's default model.
     pub model: String,
     /// The most entries one advisor answer may pick.
     pub max_items: usize,
@@ -458,14 +474,25 @@ pub struct RecallConfig {
     /// without the picks (they then go with the conversation's next owner message). At most
     /// [`MAX_RECALL_WAIT_MS`]; 0 never waits.
     pub wait_ms: u64,
-    /// `None`: `off` ([`MemoryConfig::recall_mid_task`]); shadow and on are only ever explicit.
+    /// `None`: the advisor's mode ([`MemoryConfig::recall_mid_task`]).
     pub mid_task: Option<MidTask>,
-    /// The most wakes on tool events in one lead turn.
-    pub mid_max_wakes_per_turn: u32,
-    /// The least time between a turn's start or its last wake on a tool event and the next one;
-    /// 0 allows a wake on every finished tool call (within the per-turn cap).
-    pub mid_min_interval_seconds: u64,
+    /// The most mid-task notes delivered to one conversation within `mid_cooldown_minutes`;
+    /// a wake on a tool event while that many were delivered is not started. Wakes that
+    /// deliver nothing never count.
+    pub mid_max_delivered: u32,
+    /// The window of `mid_max_delivered`, in minutes.
+    pub mid_cooldown_minutes: u64,
 }
+
+/// The default omp model of the recall advisor: omp's small fast model role.
+pub const DEFAULT_RECALL_MODEL: &str = "@smol";
+
+/// `[memory.recall]` keys moraebot no longer reads; each is ignored with a
+/// [`W_CONFIG_IGNORED`] naming it.
+const OLD_RECALL_KEYS: [&str; 2] = [
+    "memory.recall.mid_max_wakes_per_turn",
+    "memory.recall.mid_min_interval_seconds",
+];
 
 /// The longest `memory.recall.wait_ms`: an owner turn never waits longer for recalled notes.
 pub const MAX_RECALL_WAIT_MS: u64 = 10_000;
@@ -474,7 +501,7 @@ impl Default for RecallConfig {
     fn default() -> Self {
         Self {
             mode: None,
-            model: String::new(),
+            model: DEFAULT_RECALL_MODEL.to_owned(),
             max_items: 3,
             max_candidates: 32,
             max_calls_per_hour: 30,
@@ -482,8 +509,8 @@ impl Default for RecallConfig {
             timeout_seconds: 60,
             wait_ms: 2500,
             mid_task: None,
-            mid_max_wakes_per_turn: 2,
-            mid_min_interval_seconds: 60,
+            mid_max_delivered: 2,
+            mid_cooldown_minutes: 10,
         }
     }
 }
@@ -491,7 +518,7 @@ impl Default for RecallConfig {
 /// The `[memory.self]` settings: the bot's self file (#59).
 #[derive(Debug, Clone, PartialEq)]
 pub struct SelfConfig {
-    /// Whether owner corrections are recorded and promoted into the self block.
+    /// Whether owner corrections are saved in `self/observations.md` ([`crate::lessons`]).
     pub enabled: bool,
     /// Phrases that make an owner sentence a correction of the bot. Each matches as words in
     /// order, the last one as a word start so Korean endings still match (`하지 말라고 했`
@@ -519,140 +546,6 @@ impl Default for SelfConfig {
             .iter()
             .map(|s| (*s).to_owned())
             .collect(),
-        }
-    }
-}
-
-/// The `[memory.jev]` settings: how moraebot asks jev (TypeSafe System One).
-#[derive(Debug, Clone, PartialEq)]
-pub struct JevConfig {
-    /// jev runs only when this is true and a key is found; a key alone turns nothing on.
-    pub enabled: bool,
-    /// A file holding the key. `TYPESAFE_API_KEY` wins over it.
-    pub api_key_file: Option<PathBuf>,
-    /// The `TYPESAFE_API_KEY` value, handed over by `main.rs`. Never read from or written to
-    /// `config.toml`.
-    pub env_key: Option<Secret>,
-    pub base_url: String,
-    pub model: String,
-    pub timeout_seconds: u64,
-    pub classify_timeout_ms: u64,
-    pub save_threshold: f64,
-    pub classify_threshold: f64,
-    pub window_sentences: u32,
-    pub backoff_initial_seconds: u64,
-    pub backoff_max_seconds: u64,
-    pub breaker_failures: u32,
-    pub breaker_probe_seconds: u64,
-    pub questions: JevQuestions,
-}
-
-impl Default for JevConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            api_key_file: None,
-            env_key: None,
-            base_url: "https://api.typesafe.ai".to_owned(),
-            model: "jev-latest".to_owned(),
-            timeout_seconds: 10,
-            classify_timeout_ms: 1500,
-            save_threshold: 0.5,
-            classify_threshold: 0.7,
-            window_sentences: 20,
-            backoff_initial_seconds: 2,
-            backoff_max_seconds: 60,
-            breaker_failures: 5,
-            breaker_probe_seconds: 300,
-            questions: JevQuestions::default(),
-        }
-    }
-}
-
-impl JevConfig {
-    /// Sets the key taken from the `TYPESAFE_API_KEY` variable. An empty value is no key.
-    pub fn set_env_key(&mut self, key: Option<String>) {
-        self.env_key = key
-            .map(|k| k.trim().to_owned())
-            .filter(|k| !k.is_empty())
-            .map(Secret::new);
-    }
-
-    /// The env key, else the trimmed content of `api_key_file`. `None` when neither gives a
-    /// non-empty key.
-    pub fn api_key(&self) -> Option<Secret> {
-        if let Some(key) = &self.env_key {
-            return Some(key.clone());
-        }
-        let text = fs::read_to_string(self.api_key_file.as_ref()?).ok()?;
-        let key = text.trim();
-        (!key.is_empty()).then(|| Secret::new(key))
-    }
-
-    /// Whether `memory.jev.enabled` is true. Without a key jev then stays paused.
-    pub fn is_enabled(&self) -> bool {
-        self.enabled
-    }
-
-    pub fn timeout(&self) -> Duration {
-        Duration::from_secs(self.timeout_seconds)
-    }
-
-    pub fn classify_timeout(&self) -> Duration {
-        Duration::from_millis(self.classify_timeout_ms)
-    }
-}
-
-/// The jev question texts (`[memory.jev.questions]`).
-#[derive(Debug, Clone, PartialEq)]
-pub struct JevQuestions {
-    pub save: String,
-    pub save_yes: String,
-    pub save_no: String,
-    pub span: String,
-    pub bucket: String,
-    pub bucket_thread: String,
-    pub bucket_project: String,
-    pub bucket_core: String,
-    pub bucket_boundary: String,
-    pub bucket_none: String,
-}
-
-impl Default for JevQuestions {
-    fn default() -> Self {
-        let text = |s: &str| s.to_owned();
-        Self {
-            save: text(
-                "Do the sentences hold a fact, preference, decision or prohibition that will \
-                 still matter in later conversations?",
-            ),
-            save_yes: text(
-                "At least one sentence states something lasting: a rule, a preference, a \
-                 decision, a fact about the owner or a project, or something that must not be \
-                 done.",
-            ),
-            save_no: text(
-                "Only small talk, a one-off request, a question, a status update, or something \
-                 that stops mattering when this task ends.",
-            ),
-            span: text(
-                "Which one sentence best states the thing worth keeping? Pick none when no \
-                 sentence does.",
-            ),
-            bucket: text("Where does the sentence picked in span belong?"),
-            bucket_thread: text(
-                "It matters only in this conversation or for the next few days, or it is not \
-                 clearly meant as a standing rule.",
-            ),
-            bucket_project: text("A lasting fact or rule about one code project or repository."),
-            bucket_core: text(
-                "A standing rule or preference the owner says applies always or from now on, in \
-                 every conversation.",
-            ),
-            bucket_boundary: text(
-                "Something the owner says must never be done, in every conversation.",
-            ),
-            bucket_none: text("Nothing here should be kept."),
         }
     }
 }
@@ -873,14 +766,18 @@ struct LeadSection {
     #[serde(skip_serializing_if = "Option::is_none")]
     handoff_after_minutes: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    cache_minutes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     direct_status: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct MemorySection {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    jev: Option<JevSection>,
+    /// The removed `[memory.jev]` table (any keys): read only to warn with
+    /// [`W_CONFIG_IGNORED`], never written.
+    #[serde(skip_serializing)]
+    jev: Option<toml::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     filter: Option<FilterSection>,
     #[serde(rename = "self", skip_serializing_if = "Option::is_none")]
@@ -911,9 +808,15 @@ struct RecallSection {
     #[serde(skip_serializing_if = "Option::is_none")]
     mid_task: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    mid_max_wakes_per_turn: Option<u32>,
+    mid_max_delivered: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    mid_min_interval_seconds: Option<u64>,
+    mid_cooldown_minutes: Option<u64>,
+    /// No longer read ([`OLD_RECALL_KEYS`]); never written.
+    #[serde(default, skip_serializing)]
+    mid_max_wakes_per_turn: Option<toml::Value>,
+    /// No longer read ([`OLD_RECALL_KEYS`]); never written.
+    #[serde(default, skip_serializing)]
+    mid_min_interval_seconds: Option<toml::Value>,
 }
 
 #[derive(Debug, Default, Deserialize, Serialize)]
@@ -923,66 +826,6 @@ struct SelfSection {
     enabled: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     correction_patterns: Option<Vec<String>>,
-}
-
-/// On-disk `[memory.jev]`. There is deliberately no key field: the key lives in the
-/// environment or in `api_key_file`.
-#[derive(Debug, Default, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-struct JevSection {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    enabled: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    api_key_file: Option<PathBuf>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    base_url: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    model: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    timeout_seconds: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    classify_timeout_ms: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    save_threshold: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    classify_threshold: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    window_sentences: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    backoff_initial_seconds: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    backoff_max_seconds: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    breaker_failures: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    breaker_probe_seconds: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    questions: Option<QuestionsSection>,
-}
-
-#[derive(Debug, Default, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-struct QuestionsSection {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    save: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    save_yes: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    save_no: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    span: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    bucket: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    bucket_thread: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    bucket_project: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    bucket_core: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    bucket_boundary: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    bucket_none: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize, Serialize)]
@@ -1010,56 +853,12 @@ fn is_empty_section<T: Serialize>(section: &T) -> bool {
 }
 
 impl MemoryConfig {
-    fn from_section(section: Option<MemorySection>, env: &Env) -> Result<Self, ConfigError> {
+    fn from_section(section: Option<MemorySection>) -> Result<Self, ConfigError> {
         let section = section.unwrap_or_default();
-        let jev_section = section.jev.unwrap_or_default();
-        let mut jev = JevConfig {
-            enabled: jev_section.enabled.unwrap_or(false),
-            api_key_file: jev_section
-                .api_key_file
-                .map(|path| env.expand_tilde(&path))
-                .transpose()?,
-            ..JevConfig::default()
-        };
         macro_rules! take {
             ($target:expr, $source:expr, [$($field:ident),*]) => {
                 $(if let Some(value) = $source.$field { $target.$field = value; })*
             };
-        }
-        take!(
-            jev,
-            jev_section,
-            [
-                base_url,
-                model,
-                timeout_seconds,
-                classify_timeout_ms,
-                save_threshold,
-                classify_threshold,
-                window_sentences,
-                backoff_initial_seconds,
-                backoff_max_seconds,
-                breaker_failures,
-                breaker_probe_seconds
-            ]
-        );
-        if let Some(questions) = jev_section.questions {
-            take!(
-                jev.questions,
-                questions,
-                [
-                    save,
-                    save_yes,
-                    save_no,
-                    span,
-                    bucket,
-                    bucket_thread,
-                    bucket_project,
-                    bucket_core,
-                    bucket_boundary,
-                    bucket_none
-                ]
-            );
         }
         let mut filter = FilterConfig::default();
         if let Some(lists) = section.filter {
@@ -1070,6 +869,11 @@ impl MemoryConfig {
             take!(self_file, section, [enabled, correction_patterns]);
         }
         let mut recall = RecallConfig::default();
+        let mut ignored: Vec<String> = section
+            .jev
+            .map(|_| JEV_TABLE.to_owned())
+            .into_iter()
+            .collect();
         if let Some(section) = section.recall {
             recall.mode = section.mode.as_deref().map(RecallMode::parse).transpose()?;
             recall.mid_task = section
@@ -1077,6 +881,17 @@ impl MemoryConfig {
                 .as_deref()
                 .map(MidTask::parse)
                 .transpose()?;
+            for (old, key) in [
+                section.mid_max_wakes_per_turn.is_some(),
+                section.mid_min_interval_seconds.is_some(),
+            ]
+            .into_iter()
+            .zip(OLD_RECALL_KEYS)
+            {
+                if old {
+                    ignored.push(key.to_owned());
+                }
+            }
             take!(
                 recall,
                 section,
@@ -1088,13 +903,13 @@ impl MemoryConfig {
                     max_input_bytes,
                     timeout_seconds,
                     wait_ms,
-                    mid_max_wakes_per_turn,
-                    mid_min_interval_seconds
+                    mid_max_delivered,
+                    mid_cooldown_minutes
                 ]
             );
         }
         let memory = Self {
-            jev,
+            ignored,
             filter,
             self_file,
             recall,
@@ -1105,57 +920,6 @@ impl MemoryConfig {
 
     fn check_values(&self) -> Result<(), ConfigError> {
         let bad = |message: String| Err(ConfigError::new(E_CONFIG_VALUE, message));
-        let jev = &self.jev;
-        if !base_url_is_safe(&jev.base_url) {
-            return bad(format!(
-                "memory.jev.base_url '{}' must start with https:// (http:// only for 127.0.0.1 \
-                 or localhost), so the key never travels in plain text",
-                jev.base_url
-            ));
-        }
-        if jev.model.trim().is_empty() {
-            return bad("memory.jev.model must not be empty".to_owned());
-        }
-        for (name, value) in [
-            ("save_threshold", jev.save_threshold),
-            ("classify_threshold", jev.classify_threshold),
-        ] {
-            if !(0.0..=1.0).contains(&value) {
-                return bad(format!("memory.jev.{name} must be within 0 and 1"));
-            }
-        }
-        for (name, value) in [
-            ("timeout_seconds", jev.timeout_seconds),
-            ("classify_timeout_ms", jev.classify_timeout_ms),
-            ("backoff_initial_seconds", jev.backoff_initial_seconds),
-            ("backoff_max_seconds", jev.backoff_max_seconds),
-            ("breaker_failures", u64::from(jev.breaker_failures)),
-            ("breaker_probe_seconds", jev.breaker_probe_seconds),
-        ] {
-            if value == 0 {
-                return bad(format!("memory.jev.{name} must be greater than zero"));
-            }
-        }
-        if !(1..=64).contains(&jev.window_sentences) {
-            return bad("memory.jev.window_sentences must be within 1 and 64".to_owned());
-        }
-        let q = &jev.questions;
-        for (name, text) in [
-            ("save", &q.save),
-            ("save_yes", &q.save_yes),
-            ("save_no", &q.save_no),
-            ("span", &q.span),
-            ("bucket", &q.bucket),
-            ("bucket_thread", &q.bucket_thread),
-            ("bucket_project", &q.bucket_project),
-            ("bucket_core", &q.bucket_core),
-            ("bucket_boundary", &q.bucket_boundary),
-            ("bucket_none", &q.bucket_none),
-        ] {
-            if text.trim().is_empty() {
-                return bad(format!("memory.jev.questions.{name} must not be empty"));
-            }
-        }
         let f = &self.filter;
         for (name, list) in [
             ("approval", &f.approval),
@@ -1183,10 +947,8 @@ impl MemoryConfig {
             ("max_calls_per_hour", u64::from(r.max_calls_per_hour)),
             ("max_input_bytes", r.max_input_bytes as u64),
             ("timeout_seconds", r.timeout_seconds),
-            (
-                "mid_max_wakes_per_turn",
-                u64::from(r.mid_max_wakes_per_turn),
-            ),
+            ("mid_max_delivered", u64::from(r.mid_max_delivered)),
+            ("mid_cooldown_minutes", r.mid_cooldown_minutes),
         ] {
             if value == 0 {
                 return bad(format!("memory.recall.{name} must be greater than zero"));
@@ -1210,39 +972,6 @@ impl MemoryConfig {
 
     /// The on-disk section holding only the values that differ from their defaults.
     fn to_section(&self) -> Option<MemorySection> {
-        let (jev, d) = (&self.jev, JevConfig::default());
-        let (q, dq) = (&jev.questions, &d.questions);
-        let questions = QuestionsSection {
-            save: changed(&q.save, &dq.save),
-            save_yes: changed(&q.save_yes, &dq.save_yes),
-            save_no: changed(&q.save_no, &dq.save_no),
-            span: changed(&q.span, &dq.span),
-            bucket: changed(&q.bucket, &dq.bucket),
-            bucket_thread: changed(&q.bucket_thread, &dq.bucket_thread),
-            bucket_project: changed(&q.bucket_project, &dq.bucket_project),
-            bucket_core: changed(&q.bucket_core, &dq.bucket_core),
-            bucket_boundary: changed(&q.bucket_boundary, &dq.bucket_boundary),
-            bucket_none: changed(&q.bucket_none, &dq.bucket_none),
-        };
-        let jev_section = JevSection {
-            enabled: jev.enabled.then_some(true),
-            api_key_file: jev.api_key_file.clone(),
-            base_url: changed(&jev.base_url, &d.base_url),
-            model: changed(&jev.model, &d.model),
-            timeout_seconds: changed(&jev.timeout_seconds, &d.timeout_seconds),
-            classify_timeout_ms: changed(&jev.classify_timeout_ms, &d.classify_timeout_ms),
-            save_threshold: changed(&jev.save_threshold, &d.save_threshold),
-            classify_threshold: changed(&jev.classify_threshold, &d.classify_threshold),
-            window_sentences: changed(&jev.window_sentences, &d.window_sentences),
-            backoff_initial_seconds: changed(
-                &jev.backoff_initial_seconds,
-                &d.backoff_initial_seconds,
-            ),
-            backoff_max_seconds: changed(&jev.backoff_max_seconds, &d.backoff_max_seconds),
-            breaker_failures: changed(&jev.breaker_failures, &d.breaker_failures),
-            breaker_probe_seconds: changed(&jev.breaker_probe_seconds, &d.breaker_probe_seconds),
-            questions: (!is_empty_section(&questions)).then_some(questions),
-        };
         let df = FilterConfig::default();
         let filter = FilterSection {
             approval: changed(&self.filter.approval, &df.approval),
@@ -1268,14 +997,13 @@ impl MemoryConfig {
             timeout_seconds: changed(&r.timeout_seconds, &dr.timeout_seconds),
             wait_ms: changed(&r.wait_ms, &dr.wait_ms),
             mid_task: r.mid_task.map(|mid| mid.as_str().to_owned()),
-            mid_max_wakes_per_turn: changed(&r.mid_max_wakes_per_turn, &dr.mid_max_wakes_per_turn),
-            mid_min_interval_seconds: changed(
-                &r.mid_min_interval_seconds,
-                &dr.mid_min_interval_seconds,
-            ),
+            mid_max_delivered: changed(&r.mid_max_delivered, &dr.mid_max_delivered),
+            mid_cooldown_minutes: changed(&r.mid_cooldown_minutes, &dr.mid_cooldown_minutes),
+            mid_max_wakes_per_turn: None,
+            mid_min_interval_seconds: None,
         };
         let section = MemorySection {
-            jev: (!is_empty_section(&jev_section)).then_some(jev_section),
+            jev: None,
             filter: (!is_empty_section(&filter)).then_some(filter),
             self_file: (!is_empty_section(&self_file)).then_some(self_file),
             recall: (!is_empty_section(&recall)).then_some(recall),
@@ -1283,18 +1011,12 @@ impl MemoryConfig {
         (!is_empty_section(&section)).then_some(section)
     }
 
-    /// The `check-config` line for the recall advisor. Advisory: a missing model only means
-    /// an explicit shadow mode runs on omp's default model. With jev on and neither a mode nor a
-    /// model set, it says how to turn the advisor on.
+    /// The `check-config` line for the recall advisor. Advisory: an empty model only means
+    /// the advisor runs on omp's default model.
     fn recall_check(&self) -> Check {
         let mode = self.recall_mode();
         let mid = format!(", mid-task {}", self.recall_mid_task().as_str());
         let result = match (mode, self.recall_model()) {
-            (RecallMode::Off, None) if self.jev.enabled && self.recall.mode.is_none() => Ok(
-                "off (set memory.recall.model to a small fast model to run the advisor in shadow \
-                 mode)"
-                    .to_owned(),
-            ),
             (RecallMode::Off, _) => Ok("off".to_owned()),
             (RecallMode::Shadow, Some(model)) => Ok(format!("shadow, model {model}{mid}")),
             (RecallMode::Shadow, None) => Err(ConfigError::new(
@@ -1319,61 +1041,26 @@ impl MemoryConfig {
         }
     }
 
-    /// The `check-config` line for the jev key. Advisory: a missing key pauses only the jev
-    /// stage, so it must not stop the gateway from starting.
-    fn key_check(&self) -> Check {
-        let jev = &self.jev;
-        let result = if !jev.is_enabled() {
-            Ok(if jev.api_key().is_some() {
-                "off (a key is set; memory.jev.enabled = true turns jev on)".to_owned()
-            } else {
-                "off".to_owned()
-            })
-        } else if jev.env_key.is_some() {
-            Ok("key from TYPESAFE_API_KEY".to_owned())
-        } else if let Some(path) = &jev.api_key_file {
-            check_token_file(path).and_then(|detail| match jev.api_key() {
-                Some(_) => Ok(detail),
-                None => Err(ConfigError::new(
-                    crate::jev::E_JEV_AUTH,
-                    format!("key file {} is empty", path.display()),
-                )),
-            })
-        } else {
-            Err(ConfigError::new(
-                crate::jev::E_JEV_AUTH,
-                "memory.jev.enabled is true but no key is set; set TYPESAFE_API_KEY or \
-                 memory.jev.api_key_file",
-            ))
-        };
-        Check {
-            name: "memory.jev key",
-            result,
+    /// The `check-config` line for tables moraebot no longer reads (`[memory.jev]`): an
+    /// advisory [`W_CONFIG_IGNORED`] naming them. `None` when there is none.
+    fn ignored_check(&self) -> Option<Check> {
+        (!self.ignored.is_empty()).then(|| Check {
+            name: "memory",
+            result: Err(ConfigError::new(
+                W_CONFIG_IGNORED,
+                format!(
+                    "{} is no longer used and is ignored; remove it",
+                    self.ignored.join(", ")
+                ),
+            )),
             advisory: true,
-        }
-    }
-}
-
-/// `https://` to any host, or plain `http://` to the loopback host only (tests and local
-/// proxies), judged by a URL parser: `http://127.0.0.1:80@evil.com/` names `evil.com`. A URL
-/// with a user name or password is refused.
-fn base_url_is_safe(url: &str) -> bool {
-    let Ok(url) = reqwest::Url::parse(url) else {
-        return false;
-    };
-    if !url.username().is_empty() || url.password().is_some() {
-        return false;
-    }
-    match url.scheme() {
-        "https" => url.host_str().is_some(),
-        "http" => matches!(url.host_str(), Some("127.0.0.1" | "localhost" | "[::1]")),
-        _ => false,
+        })
     }
 }
 
 /// The `E_CONFIG_PARSE` error for `text`. toml's message quotes the offending line, so when
-/// the file holds an `api_key` key (never valid: the key lives in the environment or in
-/// `api_key_file`) or the error names it, a fixed message is returned instead, so the key is
+/// the file holds an `api_key` key (never valid) or the error names it, a fixed message is
+/// returned instead, so the key is
 /// never printed by `check-config` or the gateway's start error.
 fn parse_error(text: &str, err: &toml::de::Error) -> ConfigError {
     let names_key = |key: &str| {
@@ -1389,8 +1076,7 @@ fn parse_error(text: &str, err: &toml::de::Error) -> ConfigError {
         return ConfigError::new(
             E_CONFIG_PARSE,
             "config.toml holds an `api_key` key, which is not allowed (the line is not shown, so \
-             the key is not printed): remove it and set TYPESAFE_API_KEY or \
-             memory.jev.api_key_file instead",
+             the key is not printed): remove it",
         );
     }
     ConfigError::new(E_CONFIG_PARSE, err.to_string())
@@ -1511,7 +1197,7 @@ impl Config {
             ));
         }
 
-        let memory = MemoryConfig::from_section(file.memory, env)?;
+        let memory = MemoryConfig::from_section(file.memory)?;
 
         let home = match file.home {
             Some(home) => env.expand_tilde(&home)?,
@@ -1537,6 +1223,7 @@ impl Config {
                 .lead
                 .map_or_else(LeadConfig::default, |lead| LeadConfig {
                     handoff_after_minutes: lead.handoff_after_minutes,
+                    cache_minutes: lead.cache_minutes,
                     direct_status: lead.direct_status,
                 }),
             memory,
@@ -1659,11 +1346,14 @@ impl Config {
                 max_cost_usd: self.omp.max_cost_usd,
                 stall_after_minutes: self.omp.stall_after_minutes,
             }),
-            lead: (self.lead.handoff_after_minutes.is_some() || self.lead.direct_status.is_some())
-                .then_some(LeadSection {
-                    handoff_after_minutes: self.lead.handoff_after_minutes,
-                    direct_status: self.lead.direct_status,
-                }),
+            lead: (self.lead.handoff_after_minutes.is_some()
+                || self.lead.cache_minutes.is_some()
+                || self.lead.direct_status.is_some())
+            .then_some(LeadSection {
+                handoff_after_minutes: self.lead.handoff_after_minutes,
+                cache_minutes: self.lead.cache_minutes,
+                direct_status: self.lead.direct_status,
+            }),
             memory: self.memory.to_section(),
         };
         toml::to_string(&file).map_err(|e| ConfigError::new(E_CONFIG_VALUE, e.to_string()))
@@ -1750,7 +1440,7 @@ impl Config {
                 advisory: active != Platform::Bridge,
             });
         }
-        checks.push(self.memory.key_check());
+        checks.extend(self.memory.ignored_check());
         checks.push(self.memory.recall_check());
         checks.extend([
             Check {
@@ -2266,100 +1956,49 @@ mod tests {
         result.expect_err("expected an error").code
     }
 
-    fn key_file(fx: &Fixture, content: &str) -> PathBuf {
-        let path = fx.dir.path().join("jev.key");
-        fs::write(&path, content).expect("write key");
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).expect("chmod key");
-        path
-    }
-
     #[test]
     fn memory_config_defaults() {
         let fx = Fixture::new();
         let cfg = fx.load(&fx.valid_toml()).expect("loads");
         assert_eq!(cfg.memory, MemoryConfig::default());
-        let jev = &cfg.memory.jev;
-        assert_eq!(jev.base_url, "https://api.typesafe.ai");
-        assert_eq!(jev.model, "jev-latest");
-        assert_eq!(jev.timeout(), Duration::from_secs(10));
-        assert_eq!(jev.classify_timeout(), Duration::from_millis(1500));
-        assert_eq!((jev.save_threshold, jev.classify_threshold), (0.5, 0.7));
-        assert_eq!(jev.window_sentences, 20);
-        assert_eq!(
-            (
-                jev.backoff_initial_seconds,
-                jev.backoff_max_seconds,
-                jev.breaker_failures,
-                jev.breaker_probe_seconds
-            ),
-            (2, 60, 5, 300)
-        );
         assert!(cfg.memory.filter.commands.contains(&"sh".to_owned()));
-        assert!(!jev.is_enabled(), "off by default");
-        let mut env_only = cfg.memory.jev.clone();
-        env_only.set_env_key(Some("k".into()));
-        assert!(!env_only.is_enabled(), "a key alone is off");
+        assert!(
+            cfg.memory.self_file_on(),
+            "corrections are captured by default"
+        );
+        assert!(cfg.checks().iter().all(|c| c.name != "memory"));
     }
 
+    /// An install upgraded from a version with jev keeps loading: `[memory.jev]` (any keys)
+    /// is ignored with one advisory `W_CONFIG_IGNORED` naming it, and never written again.
     #[test]
-    fn memory_config_env_key_beats_the_key_file() {
+    fn an_old_jev_table_is_ignored_with_a_warning() {
         let fx = Fixture::new();
-        let key = key_file(&fx, "  FILE_KEY_1\n");
         let text = format!(
-            "{}[memory.jev]\napi_key_file = {}\n",
-            fx.valid_toml(),
-            quoted(&key)
+            "{}[memory.jev]\nenabled = true\napi_key_file = \"/nowhere\"\nbase_url = \"http://x\"\n\
+             api_key = \"KEY_SENTINEL_51c2\"\n[memory.jev.questions]\nspan = \"Pick one.\"\n",
+            fx.valid_toml()
         );
-        let mut jev = fx.load(&text).expect("loads").memory.jev;
-        assert_eq!(jev.api_key(), Some(Secret::new("FILE_KEY_1")));
-        jev.set_env_key(Some("ENV_KEY_2".into()));
-        assert_eq!(jev.api_key(), Some(Secret::new("ENV_KEY_2")));
-        jev.set_env_key(Some("  ".into()));
-        assert_eq!(jev.api_key(), Some(Secret::new("FILE_KEY_1")));
-    }
-
-    #[test]
-    fn memory_config_key_is_never_printed_or_written() {
-        let fx = Fixture::new();
-        let key = key_file(&fx, "FILE_SENTINEL_51c2");
-        let text = format!(
-            "{}[memory.jev]\napi_key_file = {}\n",
-            fx.valid_toml(),
-            quoted(&key)
-        );
-        let mut cfg = fx.load(&text).expect("loads");
-        cfg.memory.jev.set_env_key(Some("ENV_SENTINEL_77ad".into()));
+        let cfg = fx.load(&text).expect("loads");
+        assert_eq!(cfg.memory.ignored, ["[memory.jev]"]);
+        assert!(cfg.memory.self_file_on());
+        assert_eq!(cfg.memory.recall_mode(), RecallMode::On);
+        let checks = cfg.checks();
+        let warn = checks
+            .iter()
+            .find(|c| c.name == "memory")
+            .expect("ignored check");
+        assert!(warn.advisory);
+        let err = warn.result.as_ref().expect_err("warns");
+        assert_eq!(err.code, W_CONFIG_IGNORED);
+        assert!(err.message.contains("[memory.jev]"), "{}", err.message);
         let shown = format!("{cfg:?}");
         let written = cfg.to_toml().expect("serializes");
         for out in [&shown, &written] {
-            assert!(!out.contains("FILE_SENTINEL_51c2"));
-            assert!(!out.contains("ENV_SENTINEL_77ad"));
-            assert!(out.contains(key.to_str().expect("utf-8 path")));
+            assert!(!out.contains("KEY_SENTINEL_51c2"), "{out}");
         }
-        let checks = cfg.checks();
-        let check = checks
-            .iter()
-            .find(|c| c.name == "memory.jev key")
-            .expect("key check");
-        assert!(check.advisory);
-        let detail = check.result.as_ref().expect("env key passes");
-        assert!(!detail.contains("ENV_SENTINEL_77ad"));
-        let literal = format!("{}[memory.jev]\napi_key = \"x\"\n", fx.valid_toml());
-        assert_eq!(code(fx.load(&literal)), E_CONFIG_PARSE);
-    }
-
-    #[test]
-    fn memory_config_without_a_key_fails_its_check_when_enabled() {
-        let fx = Fixture::new();
-        let text = format!("{}[memory.jev]\nenabled = true\n", fx.valid_toml());
-        let cfg = fx.load(&text).expect("loads");
-        let check = cfg
-            .checks()
-            .into_iter()
-            .find(|c| c.name == "memory.jev key")
-            .expect("key check");
-        assert!(check.advisory);
-        assert_eq!(code(check.result), crate::jev::E_JEV_AUTH);
+        assert!(!written.contains("jev"), "{written}");
+        assert!(cfg.validate().is_ok());
     }
 
     #[test]
@@ -2370,21 +2009,15 @@ mod tests {
             !unchanged.to_toml().expect("serializes").contains("memory"),
             "defaults are not written"
         );
-        let key = key_file(&fx, "k");
         let text = format!(
-            "{}[memory.jev]\nenabled = true\napi_key_file = {}\nbase_url = \"http://127.0.0.1:9\"\n\
-             model = \"jev-1.14.0\"\nsave_threshold = 0.6\nwindow_sentences = 8\nbreaker_failures = 3\n\
-             [memory.jev.questions]\nspan = \"Pick one.\"\n[memory.filter]\ncommands = []\napproval = [\"ok\"]\n",
-            fx.valid_toml(),
-            quoted(&key)
+            "{}[memory.filter]\ncommands = []\napproval = [\"ok\"]\n",
+            fx.valid_toml()
         );
         let cfg = fx.load(&text).expect("loads");
         let written = cfg.to_toml().expect("serializes");
         assert!(!written.contains("timeout_seconds"), "defaults stay out");
         let again = fx.load(&written).expect("reloads");
         assert_eq!(again.memory, cfg.memory);
-        assert_eq!(again.memory.jev.model, "jev-1.14.0");
-        assert_eq!(again.memory.jev.questions.span, "Pick one.");
         assert!(again.memory.filter.commands.is_empty());
         assert_eq!(again.memory.filter.approval, vec!["ok".to_owned()]);
         assert_eq!(
@@ -2417,7 +2050,7 @@ mod tests {
     }
 
     #[test]
-    fn memory_recall_is_shadow_only_with_jev_and_a_model_and_on_only_when_asked() {
+    fn memory_recall_is_on_by_default_on_the_smol_model() {
         let fx = Fixture::new();
         let mode = |extra: &str| {
             let cfg = fx
@@ -2427,48 +2060,45 @@ mod tests {
         };
         let plain = fx.load(&fx.valid_toml()).expect("loads");
         assert_eq!(plain.memory.recall, RecallConfig::default());
-        assert_eq!(plain.memory.recall_model(), None);
-        let jev = "[memory.jev]\nenabled = true\n";
+        assert_eq!(plain.memory.recall_mode(), RecallMode::On);
+        assert_eq!(plain.memory.recall_mid_task(), MidTask::On);
+        assert_eq!(plain.memory.recall_model(), Some("@smol"));
         let model = "[memory.recall]\nmodel = \"qa-small\"\n";
-        // moraedang on #66: an upgraded jev install without a model starts no advisor.
         for (extra, want) in [
-            (String::new(), RecallMode::Off),
-            (jev.to_owned(), RecallMode::Off),
-            (model.to_owned(), RecallMode::Off),
-            (format!("{jev}{model}"), RecallMode::Shadow),
-            (format!("{jev}{model}mode = \"off\"\n"), RecallMode::Off),
+            (String::new(), RecallMode::On),
+            (model.to_owned(), RecallMode::On),
+            (format!("{model}mode = \"off\"\n"), RecallMode::Off),
             (
                 "[memory.recall]\nmode = \"shadow\"\n".to_owned(),
                 RecallMode::Shadow,
             ),
-            (
-                format!("{jev}[memory.recall]\nmode = \"shadow\"\n"),
-                RecallMode::Shadow,
-            ),
-            // PR 3: injection is never a default, only an explicit `on`.
-            (format!("{jev}{model}mode = \"on\"\n"), RecallMode::On),
-            (
-                "[memory.recall]\nmode = \"on\"\n".to_owned(),
-                RecallMode::On,
-            ),
+            (format!("{model}mode = \"on\"\n"), RecallMode::On),
         ] {
             assert_eq!(mode(&extra), want, "{extra}");
         }
-        let jev = fx
-            .load(&format!("{}{jev}{model}", fx.valid_toml()))
+        let empty = fx
+            .load(&format!(
+                "{}[memory.recall]\nmodel = \"\"\n",
+                fx.valid_toml()
+            ))
             .expect("loads");
-        let written = jev.to_toml().unwrap();
+        assert_eq!(empty.memory.recall_model(), None, "omp's default model");
+        let model_only = fx
+            .load(&format!("{}{model}", fx.valid_toml()))
+            .expect("loads");
+        let written = model_only.to_toml().unwrap();
         assert!(
             !written.lines().any(|line| line.starts_with("mode =")),
             "the default stays implicit: {written}"
         );
 
         let text = format!(
-            "{}[memory.jev]\nenabled = true\n[memory.recall]\nmode = \"off\"\nmodel = \"claude-haiku-5-5\"\nmax_calls_per_hour = 5\n",
+            "{}[memory.recall]\nmode = \"off\"\nmodel = \"claude-haiku-5-5\"\nmax_calls_per_hour = 5\n",
             fx.valid_toml()
         );
         let cfg = fx.load(&text).expect("loads");
         assert_eq!(cfg.memory.recall_mode(), RecallMode::Off);
+        assert_eq!(cfg.memory.recall_mid_task(), MidTask::Off);
         assert_eq!(cfg.memory.recall_model(), Some("claude-haiku-5-5"));
         assert_eq!(cfg.memory.recall.max_calls_per_hour, 5);
         assert_eq!(cfg.memory.recall.wait_ms, 2500);
@@ -2504,7 +2134,7 @@ mod tests {
     }
 
     #[test]
-    fn check_config_warns_about_a_shadow_advisor_without_a_model() {
+    fn check_config_names_the_advisor_mode_and_warns_without_a_model() {
         let fx = Fixture::new();
         let check = |text: &str| {
             let cfg = fx.load(text).expect("loads");
@@ -2516,46 +2146,35 @@ mod tests {
             assert!(check.advisory);
             check.result.map_err(|e| e.code)
         };
-        assert_eq!(check(&fx.valid_toml()), Ok("off".to_owned()));
-        let jev = format!("{}[memory.jev]\nenabled = true\n", fx.valid_toml());
+        let plain = fx.valid_toml();
         assert_eq!(
-            check(&jev),
-            Ok(
-                "off (set memory.recall.model to a small fast model to run the advisor in \
-                 shadow mode)"
-                    .to_owned()
-            ),
-            "one hint line on how to turn it on"
+            check(&plain),
+            Ok("on, model @smol, owner turns wait up to 2500 ms, mid-task on".to_owned())
         );
-        let off = format!("{jev}[memory.recall]\nmode = \"off\"\n");
+        let off = format!("{plain}[memory.recall]\nmode = \"off\"\n");
         assert_eq!(check(&off), Ok("off".to_owned()), "turned off on purpose");
-        let asked = format!("{jev}[memory.recall]\nmode = \"shadow\"\n");
+        let shadow = format!("{plain}[memory.recall]\nmode = \"shadow\"\nmodel = \"qa-small\"\n");
         assert_eq!(
-            check(&asked),
-            Err(E_CONFIG_VALUE),
-            "shadow on the default model"
+            check(&shadow),
+            Ok("shadow, model qa-small, mid-task shadow".to_owned())
         );
-        let model = format!("{jev}[memory.recall]\nmodel = \"qa-small\"\n");
+        for mode in ["shadow", "on"] {
+            let empty = format!("{plain}[memory.recall]\nmode = \"{mode}\"\nmodel = \"\"\n");
+            assert_eq!(
+                check(&empty),
+                Err(E_CONFIG_VALUE),
+                "{mode} on omp's default model"
+            );
+        }
+        let mid_off = format!("{plain}[memory.recall]\nmid_task = \"off\"\n");
         assert_eq!(
-            check(&model),
-            Ok("shadow, model qa-small, mid-task off".to_owned())
-        );
-        let on = format!("{jev}[memory.recall]\nmode = \"on\"\n");
-        assert_eq!(check(&on), Err(E_CONFIG_VALUE), "on on the default model");
-        let on = format!("{jev}[memory.recall]\nmode = \"on\"\nmodel = \"qa-small\"\n");
-        assert_eq!(
-            check(&on),
-            Ok("on, model qa-small, owner turns wait up to 2500 ms, mid-task off".to_owned())
-        );
-        let mid_on = format!("{on}mid_task = \"on\"\n");
-        assert_eq!(
-            check(&mid_on),
-            Ok("on, model qa-small, owner turns wait up to 2500 ms, mid-task on".to_owned())
+            check(&mid_off),
+            Ok("on, model @smol, owner turns wait up to 2500 ms, mid-task off".to_owned())
         );
     }
 
     #[test]
-    fn mid_task_recall_is_off_by_default_and_on_only_with_mode_on() {
+    fn mid_task_recall_follows_the_mode_unless_set_and_is_on_only_with_mode_on() {
         let fx = Fixture::new();
         let with = |body: &str| format!("{}[memory.recall]\n{body}\n", fx.valid_toml());
         let mid = |body: &str| {
@@ -2570,39 +2189,24 @@ mod tests {
             "no advisor, no mid wakes"
         );
         assert_eq!(mid("mode = \"off\"\nmid_task = \"shadow\""), MidTask::Off);
-        // Maintainer decision on #71: no install gains mid-task calls without a config edit.
-        assert_eq!(mid("mode = \"shadow\""), MidTask::Off);
-        assert_eq!(mid("mode = \"on\""), MidTask::Off);
-        assert_eq!(
-            mid("mode = \"shadow\"\nmid_task = \"shadow\""),
-            MidTask::Shadow
-        );
+        assert_eq!(mid("mode = \"shadow\""), MidTask::Shadow);
+        assert_eq!(mid("mode = \"on\""), MidTask::On);
+        assert_eq!(mid("mid_task = \"on\""), MidTask::On);
         assert_eq!(mid("mode = \"on\"\nmid_task = \"shadow\""), MidTask::Shadow);
-        let jev = format!(
-            "{}[memory.jev]\nenabled = true\n[memory.recall]\nmodel = \"qa-small\"\n",
-            fx.valid_toml()
-        );
-        let upgraded = fx.load(&jev).expect("loads").memory;
-        assert_eq!(upgraded.recall_mode(), RecallMode::Shadow);
-        assert_eq!(
-            upgraded.recall_mid_task(),
-            MidTask::Off,
-            "an upgraded install"
-        );
         assert_eq!(mid("mode = \"shadow\"\nmid_task = \"off\""), MidTask::Off);
-        assert_eq!(mid("mode = \"on\"\nmid_task = \"on\""), MidTask::On);
+        assert_eq!(mid("mid_task = \"off\""), MidTask::Off);
         let plain = fx.load(&fx.valid_toml()).expect("loads");
-        assert_eq!(plain.memory.recall_mid_task(), MidTask::Off);
-        assert_eq!(plain.memory.recall.mid_max_wakes_per_turn, 2);
-        assert_eq!(plain.memory.recall.mid_min_interval_seconds, 60);
+        assert_eq!(plain.memory.recall.mid_max_delivered, 2);
+        assert_eq!(plain.memory.recall.mid_cooldown_minutes, 10);
 
         let set = fx
             .load(&with(
-                "mode = \"on\"\nmid_task = \"on\"\nmid_max_wakes_per_turn = 4\nmid_min_interval_seconds = 0",
+                "mode = \"on\"\nmid_task = \"on\"\nmid_max_delivered = 4\nmid_cooldown_minutes = 5",
             ))
             .expect("loads");
         let written = set.to_toml().expect("serializes");
         assert!(written.contains("mid_task = \"on\""), "{written}");
+        assert!(written.contains("mid_max_delivered = 4"), "{written}");
         assert_eq!(fx.load(&written).expect("reloads").memory, set.memory);
         let default = fx.load(&with("mode = \"shadow\"")).expect("loads");
         let written = default.to_toml().expect("serializes");
@@ -2612,56 +2216,41 @@ mod tests {
         );
 
         for bad in [
-            "mid_task = \"on\"",
             "mode = \"shadow\"\nmid_task = \"on\"",
             "mode = \"off\"\nmid_task = \"on\"",
             "mode = \"on\"\nmid_task = \"live\"",
-            "mode = \"on\"\nmid_max_wakes_per_turn = 0",
+            "mid_max_delivered = 0",
+            "mid_cooldown_minutes = 0",
         ] {
             assert_eq!(code(fx.load(&with(bad))), E_CONFIG_VALUE, "{bad}");
         }
     }
 
+    /// The per-turn cap and the interval of earlier versions are gone: their keys still load,
+    /// with one advisory `W_CONFIG_IGNORED` naming them, and are never written again.
     #[test]
-    fn memory_config_refuses_plain_http() {
+    fn the_old_mid_wake_keys_are_ignored_with_a_warning() {
         let fx = Fixture::new();
-        let with_url =
-            |url: &str| format!("{}[memory.jev]\nbase_url = \"{url}\"\n", fx.valid_toml());
-        for bad in [
-            "http://api.typesafe.ai",
-            "http://localhost.example.com",
-            "http://127.0.0.1.example.com/",
-            "ftp://api.typesafe.ai",
-        ] {
-            assert_eq!(code(fx.load(&with_url(bad))), E_CONFIG_VALUE, "{bad}");
-        }
-        for good in [
-            "https://api.typesafe.ai",
-            "http://127.0.0.1:4100",
-            "http://localhost/",
-        ] {
-            fx.load(&with_url(good)).expect(good);
-        }
-    }
-
-    /// moraedang on #46: a URL parser reads `127.0.0.1:80@` as userinfo, so the host of these
-    /// is `evil.com` and the key would travel there in plain text.
-    #[test]
-    fn memory_config_refuses_userinfo_in_the_jev_url() {
-        let fx = Fixture::new();
-        let with_url =
-            |url: &str| format!("{}[memory.jev]\nbase_url = \"{url}\"\n", fx.valid_toml());
-        for bad in [
-            "http://127.0.0.1:80@evil.com/",
-            "http://localhost:x@evil.com/",
-            "https://user:pw@api.typesafe.ai",
-            "https://user@api.typesafe.ai",
-            "not a url",
-        ] {
-            assert_eq!(code(fx.load(&with_url(bad))), E_CONFIG_VALUE, "{bad}");
-        }
-        fx.load(&with_url("http://[::1]:4100/"))
-            .expect("IPv6 loopback");
+        let text = format!(
+            "{}[memory.recall]\nmid_max_wakes_per_turn = 4\nmid_min_interval_seconds = 0\n",
+            fx.valid_toml()
+        );
+        let cfg = fx.load(&text).expect("loads");
+        assert_eq!(cfg.memory.ignored, OLD_RECALL_KEYS);
+        let checks = cfg.checks();
+        let warn = checks
+            .iter()
+            .find(|c| c.name == "memory")
+            .expect("ignored check");
+        let err = warn.result.as_ref().expect_err("warns");
+        assert_eq!(err.code, W_CONFIG_IGNORED);
+        assert!(
+            err.message.contains("mid_max_wakes_per_turn"),
+            "{}",
+            err.message
+        );
+        let written = cfg.to_toml().expect("serializes");
+        assert!(!written.contains("mid_m"), "{written}");
     }
 
     /// moraedang on #46: toml's parse error quotes the offending line, so a key written into
@@ -2671,13 +2260,9 @@ mod tests {
         let fx = Fixture::new();
         let sentinel = "KEY_SENTINEL_e41f";
         for text in [
+            format!("{}[memory]\napi_key = \"{sentinel}\"\n", fx.valid_toml()),
             format!(
-                "{}[memory.jev]\napi_key = \"{sentinel}\"\n",
-                fx.valid_toml()
-            ),
-            format!("{}[memory.jev]\napi_key = \"{sentinel}\n", fx.valid_toml()),
-            format!(
-                "{}[memory]\njev.api_key = \"{sentinel}\"\n",
+                "{}[memory.filter]\napi_key = \"{sentinel}\n",
                 fx.valid_toml()
             ),
         ] {
@@ -2688,44 +2273,9 @@ mod tests {
         }
     }
 
-    /// Owner decision on #46: jev is opt-in. A key alone turns nothing on.
     #[test]
-    fn memory_config_jev_needs_enabled_and_a_key() {
+    fn memory_config_refuses_an_empty_filter_pattern() {
         let fx = Fixture::new();
-        let key = key_file(&fx, "k\n");
-        let with_key = format!(
-            "{}[memory.jev]\napi_key_file = {}\n",
-            fx.valid_toml(),
-            quoted(&key)
-        );
-        let keyed = fx.load(&with_key).expect("loads");
-        assert!(!keyed.memory.jev.is_enabled(), "a key alone is off");
-        let check = keyed
-            .checks()
-            .into_iter()
-            .find(|c| c.name == "memory.jev key")
-            .expect("key check");
-        let detail = check.result.expect("passes");
-        assert!(detail.starts_with("off"), "{detail}");
-        let on = format!("{with_key}enabled = true\n");
-        assert!(fx.load(&on).expect("loads").memory.jev.is_enabled());
-    }
-
-    #[test]
-    fn memory_config_refuses_out_of_range_values() {
-        let fx = Fixture::new();
-        for line in [
-            "save_threshold = 1.5",
-            "classify_threshold = -0.1",
-            "timeout_seconds = 0",
-            "breaker_failures = 0",
-            "window_sentences = 0",
-            "window_sentences = 65",
-            "model = \" \"",
-        ] {
-            let text = format!("{}[memory.jev]\n{line}\n", fx.valid_toml());
-            assert_eq!(code(fx.load(&text)), E_CONFIG_VALUE, "{line}");
-        }
         let empty = format!("{}[memory.filter]\ncommands = [\"\"]\n", fx.valid_toml());
         assert_eq!(code(fx.load(&empty)), E_CONFIG_VALUE);
     }
@@ -2733,12 +2283,7 @@ mod tests {
     #[test]
     fn memory_config_refuses_unknown_keys() {
         let fx = Fixture::new();
-        for section in [
-            "[memory]\nnope = 1\n",
-            "[memory.jev]\nnope = 1\n",
-            "[memory.jev.questions]\nnope = \"x\"\n",
-            "[memory.filter]\nnope = []\n",
-        ] {
+        for section in ["[memory]\nnope = 1\n", "[memory.filter]\nnope = []\n"] {
             let text = format!("{}{section}", fx.valid_toml());
             assert_eq!(code(fx.load(&text)), E_CONFIG_PARSE, "{section}");
         }
@@ -3104,6 +2649,24 @@ mod tests {
         assert_eq!(fx.load(&off).expect("loads").lead.handoff_after(), None);
         let unknown = format!("{}[lead]\nhandoff_after = 3\n", fx.valid_toml());
         assert!(fx.load(&unknown).is_err());
+    }
+
+    #[test]
+    fn cache_minutes_is_parsed_and_zero_restarts_on_any_change() {
+        let fx = Fixture::new();
+        let cfg = fx.load(&fx.valid_toml()).expect("loads");
+        assert_eq!(cfg.lead.cache_window(), Some(Duration::from_secs(60 * 60)));
+        let ten = format!("{}[lead]\ncache_minutes = 10\n", fx.valid_toml());
+        let cfg = fx.load(&ten).expect("loads");
+        assert_eq!(cfg.lead.cache_window(), Some(Duration::from_secs(10 * 60)));
+        let again = fx
+            .load(&cfg.to_toml().expect("serializes"))
+            .expect("reloads");
+        assert_eq!(again.lead.cache_minutes, Some(10));
+        let off = format!("{}[lead]\ncache_minutes = 0\n", fx.valid_toml());
+        assert_eq!(fx.load(&off).expect("loads").lead.cache_window(), None);
+        let negative = format!("{}[lead]\ncache_minutes = -1\n", fx.valid_toml());
+        assert!(fx.load(&negative).is_err());
     }
 
     #[test]

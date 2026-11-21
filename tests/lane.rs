@@ -2391,3 +2391,148 @@ async fn lane_prompt_is_passed_as_a_private_file() {
     assert!(h.lane(1).closed);
     assert!(!path.exists(), "a closed lane keeps no memory text");
 }
+
+/// A lane keeps the memory block its first job in this process started with: a memory change
+/// between two jobs leaves the second start's system prompt as it was and reaches the lane as
+/// an update block in the job's prompt, once; a lane started after the change gets the new
+/// block in its system prompt.
+#[tokio::test]
+async fn lane_memory_block_stays_pinned_across_jobs() {
+    use moraebot::memory::{Bucket, Day, MemoryStore, NewEntry, Prov, Redactor, Source};
+    use moraebot::pin::UPDATE_OPEN;
+    let h = Harness::new();
+    let today = Day::parse("2026-11-20").unwrap();
+    let add = |text: &str| {
+        let mut store =
+            MemoryStore::open(&h.config.home, Redactor::default(), Arc::new(move || today))
+                .expect("memory store");
+        store
+            .add(NewEntry {
+                text: text.into(),
+                prov: Prov::Owner,
+                bucket: Bucket::Boundaries,
+                src: Source::row(1),
+                expires: None,
+                why: None,
+            })
+            .expect("add");
+    };
+    add("never force-push");
+    let m0 = h
+        .manager("ok", &[lane_start("t1")])
+        .with_memory_clock(Arc::new(move || today));
+    prompt_until_lane_result(&m0, 1, "run-tools go").await;
+    bounded(m0.shutdown_all()).await;
+
+    let message =
+        json!({"tool": lane::LANE_MESSAGE_TOOL, "arguments": {"lane_id": 1, "text": "t2"}});
+    let omp = h
+        .manager("ok", &[message])
+        .with_memory_clock(Arc::new(move || today));
+    prompt_until_lane_result(&omp, 2, "run-tools go").await;
+    add("never delete branches");
+    prompt_until_lane_result(&omp, 3, "run-tools go").await;
+    prompt_until_lane_result(&omp, 4, "run-tools go").await;
+    let lines = h.log_lines();
+    let starts = h.lane_starts();
+    assert_eq!(starts.len(), 4);
+    let blocks: Vec<String> = starts.iter().map(|&n| appended(&lines[n])).collect();
+    assert!(blocks[1].contains("never force-push"), "{}", blocks[1]);
+    assert!(
+        !blocks[1].contains("never delete branches"),
+        "{}",
+        blocks[1]
+    );
+    assert_eq!(blocks[2], blocks[1], "the system prompt stays pinned");
+    assert_eq!(blocks[3], blocks[1], "the system prompt stays pinned");
+    let prompt = |nth: usize| {
+        h.frames_after_start(nth, "prompt")[0]["message"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    };
+    // The first job after moraebot restarted resumes the lane's session, which may hold an
+    // earlier update: it hears that its system prompt holds.
+    assert!(
+        prompt(1).contains(moraebot::pin::REVERT_HEADER),
+        "{}",
+        prompt(1)
+    );
+    let update = prompt(2);
+    assert!(update.starts_with("t2"), "{update}");
+    assert!(update.contains(UPDATE_OPEN), "{update}");
+    assert!(update.contains("never delete branches"), "{update}");
+    assert!(!prompt(3).contains(UPDATE_OPEN), "told once: {}", prompt(3));
+    bounded(omp.shutdown_all()).await;
+
+    let m2 = h
+        .manager("ok", &[lane_start("t3")])
+        .with_memory_clock(Arc::new(move || today));
+    prompt_until_lane_result(&m2, 5, "run-tools go").await;
+    bounded(m2.shutdown_all()).await;
+    let lines = h.log_lines();
+    let starts = h.lane_starts();
+    let fresh = appended(&lines[starts[4]]);
+    assert!(fresh.contains("never delete branches"), "{fresh}");
+    assert!(!prompt(4).contains(UPDATE_OPEN), "{}", prompt(4));
+}
+
+/// A job whose prompt never reached the lane (here refused) did not tell it the memory
+/// update: the lane's next job carries it again.
+#[tokio::test]
+async fn a_memory_update_in_a_refused_prompt_goes_in_again() {
+    use moraebot::memory::{Bucket, Day, MemoryStore, NewEntry, Prov, Redactor, Source};
+    use moraebot::pin::UPDATE_OPEN;
+    let h = Harness::new();
+    let today = Day::parse("2026-11-20").unwrap();
+    let add = |text: &str| {
+        let mut store =
+            MemoryStore::open(&h.config.home, Redactor::default(), Arc::new(move || today))
+                .expect("memory store");
+        store
+            .add(NewEntry {
+                text: text.into(),
+                prov: Prov::Owner,
+                bucket: Bucket::Boundaries,
+                src: Source::row(1),
+                expires: None,
+                why: None,
+            })
+            .expect("add");
+    };
+    add("never force-push");
+    let m0 = h
+        .manager("ok", &[lane_start("t1")])
+        .with_memory_clock(Arc::new(move || today));
+    prompt_until_lane_result(&m0, 1, "run-tools go").await;
+    bounded(m0.shutdown_all()).await;
+    let message =
+        json!({"tool": lane::LANE_MESSAGE_TOOL, "arguments": {"lane_id": 1, "text": "t2"}});
+    // Refuses every lane prompt that carries an update (the lead's input never starts with
+    // the job text), so each job shows whether it was sent.
+    let omp = h
+        .manager("ok", &[message])
+        .with_memory_clock(Arc::new(move || today))
+        .with_extra_env([(
+            "FAKE_OMP_REJECT_TRIGGER",
+            format!("t2\n\n{UPDATE_OPEN}\n{}", moraebot::pin::UPDATE_HEADER),
+        )]);
+    prompt_until_lane_result(&omp, 2, "run-tools go").await;
+    add("never delete branches");
+    prompt_until_lane_result(&omp, 3, "run-tools go").await;
+    prompt_until_lane_result(&omp, 4, "run-tools go").await;
+    bounded(omp.shutdown_all()).await;
+    let prompt = |nth: usize| {
+        h.frames_after_start(nth, "prompt")[0]["message"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    };
+    assert!(prompt(1).starts_with("t2"), "{}", prompt(1));
+    assert!(prompt(2).contains(UPDATE_OPEN), "{}", prompt(2));
+    assert!(
+        prompt(3).contains(UPDATE_OPEN) && prompt(3).contains("never delete branches"),
+        "the refused prompt told nothing: {}",
+        prompt(3)
+    );
+}

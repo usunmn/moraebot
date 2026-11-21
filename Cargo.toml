@@ -50,8 +50,6 @@ reqwest = { version = "0.13.5", default-features = false, features = ["json", "n
 tokio-tungstenite = { version = "0.30.0", default-features = false, features = ["connect", "native-tls"] }
 # Stream/Sink helpers for the Socket Mode WebSocket.
 futures-util = { version = "0.3.34", default-features = false, features = ["sink", "std"] }
-# sha256 of subagent output files, for the memory observer's cursor.
-sha2 = "0.10"
 # NFKC for the memory excerpt filter, so compatibility look-alikes match the filter lists.
 unicode-normalization = "0.1"
 # Standard base64 for chat image attachments.

@@ -1189,13 +1189,18 @@ async fn onboarding_through_the_gateway() {
 
     assert_eq!(
         rig.tap.lead_pids().len(),
-        3,
-        "a restart for the new persona, then one lead for the second run"
+        2,
+        "the warm lead keeps its prompt; the second run starts with the new persona"
     );
     let appends = lead_appends(&rig.tap);
-    assert_eq!(appends.len(), 3);
+    assert_eq!(appends.len(), 2);
     assert!(!appends[0].contains("Name: Sora"));
-    assert!(appends[1..].iter().all(|a| a.contains("Name: Sora")));
+    assert!(appends[1].contains("Name: Sora"));
+    let after_finish = prompts[2]["message"].as_str().expect("prompt message");
+    assert!(
+        after_finish.contains(moraebot::pin::UPDATE_OPEN) && after_finish.contains("Name: Sora"),
+        "the new persona reaches the warm lead as an update block: {after_finish}"
+    );
     assert_eq!(
         std::fs::read_to_string(persona::path(&rig.config.home)).expect("persona file"),
         persona::render("Sora", "short and warm", "Owner 111 likes short replies").unwrap()

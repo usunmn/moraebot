@@ -14,7 +14,7 @@
 //! - otherwise `lane` when the text is one whole sentence of the lane's own words in a lane
 //!   result row of the group (a plain or `done` result) and the excerpt filter
 //!   ([`ExcerptFilter`]) accepts it; the entry then names the lane, its result and the
-//!   sentence, the same source the observer gives that sentence's summary, so only one entry
+//!   sentence, so only one entry
 //!   is kept whichever comes first ([`MemoryHandle::queue_add`], [`memory::Op::AddUnique`]);
 //! - otherwise `tool` when the lead child has used a tool that may read outside text
 //!   ([`reads_outside`]) since it started, or when the group holds a lane result row (its
@@ -165,8 +165,10 @@ pub fn write_tool(
 ) -> HostTool {
     HostTool::new(
         MEMORY_WRITE_TOOL,
-        "Save a note in moraebot's memory, for example when the owner asks you to remember \
-         something. Returns the entry id at once; the write finishes in the background. \
+        "Save a note in moraebot's memory: when the owner asks you to remember something, \
+         and when you learn something a later turn will need (an approach or command that \
+         failed or worked here and why, a project fact you had to dig out); one short fact \
+         per note, never a secret. Returns the entry id at once; the write finishes in the background. \
          moraebot decides whose words it is: it counts as the owner's only when `text` is \
          one whole sentence the owner wrote in this turn, copied exactly (a quoted `>` line \
          or a code block the owner pasted does not count); anything else is \
@@ -328,7 +330,7 @@ pub fn plan_write(
 
 /// The whole sentence `text` of lane result row `row` (a plain or `done` result), with the
 /// lane's source (`lane=<id> seq=<n> s=<sentence>`, from the tag, the row's message id and
-/// the sentence's number, as the observer numbers it).
+/// the sentence's number, as [`memory::own_sentences`] numbers it).
 fn lane_sentence(row: &InboxRow, text: &str) -> Option<(String, Source)> {
     let tag = lead::parse_tag(&row.text)?;
     let lane = tag

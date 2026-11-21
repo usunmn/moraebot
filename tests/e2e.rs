@@ -349,8 +349,9 @@ async fn graceful_stop_then_restart_holds_queued_rows_behind_the_interrupted_one
         .await;
     bounded(BOUND, adapter.wait_for_send(2)).await;
     tap.wait_for(|line| {
-        serde_json::from_str::<Value>(line)
-            .is_ok_and(|frame| frame["type"] == "prompt" && prompt_body(&frame) == "third")
+        serde_json::from_str::<Value>(line).is_ok_and(|frame| {
+            frame["type"] == "prompt" && prompt_body(&frame).starts_with("third")
+        })
     })
     .await;
     running.stop().await.expect("clean stop");
@@ -362,9 +363,14 @@ async fn graceful_stop_then_restart_holds_queued_rows_behind_the_interrupted_one
         .filter(|frame| frame["type"] == "prompt")
         .map(|frame| prompt_body(&frame))
         .collect();
+    // The restarted moraebot resumes the lead's session, which may hold an earlier memory
+    // update, so its first input says the system prompt holds again.
     assert_eq!(
         messages,
-        ["first", "third"],
+        [
+            "first".to_owned(),
+            format!("third\n\n{}", moraebot::pin::revert_notice())
+        ],
         "the held message never reaches omp"
     );
     let sends: Vec<(String, String)> = adapter
@@ -379,7 +385,10 @@ async fn graceful_stop_then_restart_holds_queued_rows_behind_the_interrupted_one
         sends,
         vec![
             (MESSAGE_ID.to_owned(), notice_text(N_INTERRUPTED).to_owned()),
-            ("1300000000000000005".to_owned(), "echo: third".to_owned()),
+            (
+                "1300000000000000005".to_owned(),
+                format!("echo: third\n\n{}", moraebot::pin::revert_notice()),
+            ),
         ],
         "exactly one interrupted notice for the conversation"
     );

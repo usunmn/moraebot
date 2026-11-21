@@ -1,13 +1,13 @@
 # Recall advisor eval
 
-The recall advisor (#59) runs in shadow mode by default. With `memory.recall.mode = "on"` its picks reach the lead ([On mode](memory.md#on-mode)), which is only safe while it picks well. This eval checks that offline, on about 35 synthetic conversations in `tests/recall_eval/cases.json`.
+The recall advisor (#59) runs in on mode by default (`memory.recall.mode = "on"`, mid-task recall on too, model `@smol`): its picks reach the lead ([On mode](memory.md#on-mode)), which is only safe while it picks well. This eval checks that offline, on 35 synthetic conversations in `tests/recall_eval/cases.json`.
 
 ## What a case holds
 
 - **A seeded memory store.** Each case's store is built through moraebot's own memory writer, so every line is committed the way the gateway commits it. It holds:
   - owner, lane, subagent and tool lines;
-  - entries in other conversations and projects;
-  - core and self entries;
+  - entries in the conversation's own thread, in projects and in `_general`. Every case's conversation is a channel thread, where other conversations' threads are out of the advisor's scope (it reads them only in the owner's DM), so the entries a case keeps beside its own thread sit in `_general`;
+  - a boundaries entry (core, never offered) and owner corrections (`self_obs`);
   - replaced entries and forgotten entries;
   - for some cases, 80 unrelated filler entries. These make the pool larger than `recall::POOL_ALL_BYTES`, so the candidate stage has to rank and cut it.
 - **One to three owner turns.** A turn with `"phase": "mid"` is a wake while the lead already works on that message, after the tool calls in its `events` (see [Mid-task turns](#mid-task-turns)).
@@ -25,7 +25,7 @@ The messages are in Korean and English.
 
 ### Mid-task turns
 
-Five cases are mid-task turns ([Mid-task recall](memory.md#mid-task-recall)): a tool error that an old note explains, a web result that claims your approval (an injection case), a repeat of a command that failed before, a routine file read (nothing), and a switch to another project inside the turn. Each `events` item is one tool call: `tool`, `args`, and when it ended a `result` and `error`. The harness renders them with the production functions the lead's event drain uses (`recall::event_start_line`, `recall::event_end_line`), ranks the candidates against the message and those lines (`recall::rank_text`), and builds the `phase=mid` envelope with `recall::message`. A CI test checks that the injected web result reaches the advisor only as `(left out)`.
+Five cases are mid-task turns ([Mid-task recall](memory.md#mid-task-recall)): a tool error that an old note explains, a web result that claims your approval (an injection case), a repeat of a command that failed before, a routine file read (nothing), and a switch to another project inside the turn. Each `events` item is one tool call: `tool`, `args`, and when it ended a `result` and `error`. The harness renders them with the production functions the lead's event drain uses (`recall::event_start_line`, `recall::event_end_line`) and runs the production candidate stage on a `phase=mid` wake that carries them (see below). A CI test checks that the injected web result reaches the advisor only as `(left out)`.
 
 ## What is measured
 
@@ -33,7 +33,7 @@ Each turn runs through three methods, and the picks are scored against gold:
 
 - **no advisor**: the entries `thread_memory` already shows, meaning the live entries of the conversation's own thread and of the projects the message names;
 - **memory_search top 3**: `memory_search` on the message's keywords, keeping the 3 entries that the most keywords hit;
-- **the advisor**: the production candidate stage (`memory::recall_pool`, `recall::rank`, `recall::candidate_line` and `recall::message`), the advisor's answer, `recall::parse_answer`, then the injection guard `recall::drop_unverified_claims`. Picks the guard moves to the rejects are not counted as picks; the table shows them in their own column.
+- **the advisor**: the production candidate stage (`memory::recall_pool`, then `recall::prepare`, which keeps the entries `recall::in_scope` allows and the ledger does not hide, ranks them with `recall::rank` against `recall::rank_text`, renders them with `recall::candidate_line` and builds the message with `recall::message`), the advisor's answer, `recall::parse_answer`, then the injection guard `recall::drop_unverified_claims`. Picks the guard moves to the rejects are not counted as picks; the table shows them in their own column.
 
 In a multi-turn case, the advisor's picks and rejects are both carried between turns through a real recall ledger, with the code `Recall::run` uses (`Store::record_recall`, `Store::recall_seen`, `recall::hidden`). An entry picked earlier is not offered again in the lead context, and an entry rejected earlier is not offered again in that conversation for `REJECT_DAYS` days. A later turn's gold entry picked early counts once, as gold of the turn that picked it.
 
@@ -46,13 +46,13 @@ In a multi-turn case, the advisor's picks and rejects are both carried between t
 - false picks on at most 10% of "nothing" turns;
 - no forgotten entry picked.
 
-The harness also fails at once if a forgotten entry or a self entry is ever offered.
+The harness also fails at once if a forgotten entry is ever offered.
 
 ## In CI
 
 `cargo test --test recall_eval` runs the harness with fake advisors, so it needs no model:
 
-- **Candidate stage.** Every gold entry reaches the advisor's candidate list, and forgotten and self entries never do.
+- **Candidate stage.** Every gold entry reaches the advisor's candidate list, and forgotten entries never do.
 - **Oracle fake.** It picks the gold ids the advisor message really holds. It must score precision 1 and recall 1 and pass the bar. Both baselines must fail the bar.
 - **Silent, greedy and garbled fakes.** Each must fail the bar:
   - silent fails with no picks;
@@ -76,7 +76,7 @@ MORAEBOT_RECALL_EVAL=1 MORAEBOT_RECALL_EVAL_MODEL=<provider/model> \
 | Variable | Meaning |
 | --- | --- |
 | `MORAEBOT_RECALL_EVAL=1` | Required. Without it the test returns at once. |
-| `MORAEBOT_RECALL_EVAL_CONFIG` | A moraebot `config.toml`. Its `omp_path` and `memory.recall.model` are used. Without it, the `omp` on `PATH` and omp's default model are used. |
+| `MORAEBOT_RECALL_EVAL_CONFIG` | A moraebot `config.toml`. Its `omp_path` and `memory.recall.model` are used. Without it, the `omp` on `PATH` and the default model `@smol` are used. |
 | `MORAEBOT_RECALL_EVAL_MODEL` | Overrides `memory.recall.model`. |
 | `MORAEBOT_KIBITZER_PERSONA` | The path to omo's `kibitzer-persona.md`. When set, the same cases also run through omo's Kibitzer prompt on the same model, as a reference row. |
 
@@ -98,16 +98,18 @@ The Kibitzer row approximates omo's setup and does not reproduce it exactly:
 - **Persona file.** The persona file belongs to omo and is not copied into this repository.
 - **Guard.** Both rows pass through moraebot's code guard, so the Kibitzer row's injection picks show up in the guard column, not as picks.
 
-## The gate for turning on mode on by default
+## On mode as the default
 
-On mode exists, but no install gets it unless its owner sets `mode = "on"`, and the defaults stay as they are (shadow with jev on and a model, off otherwise). Changing that default needs a passing live run **on the production advisor model, Haiku**:
+On mode and mid-task recall are the defaults (`mode = "on"`, `mid_task` follows `mode`), on `memory.recall.model = "@smol"`, omp's small fast model role. The eval scores the wake for your message and the mid-task wakes: what on mode delivers is the same pick set, with the same injection guard, rendered by moraebot.
+
+The live run on record used `cliproxy/deepseek-v4.1-flash`, because no Haiku provider was reachable from the machine it ran on; it passed the bar. To check the model your `@smol` role resolves to, run the live test on it:
 
 ```sh
-MORAEBOT_RECALL_EVAL=1 MORAEBOT_RECALL_EVAL_MODEL=<provider>/claude-haiku-5-5 \
+MORAEBOT_RECALL_EVAL=1 MORAEBOT_RECALL_EVAL_MODEL=<provider>/<model> \
   cargo test --test recall_eval live_advisor_meets_the_bar -- --ignored --nocapture
 ```
 
-The run so far used `cliproxy/deepseek-v4.1-flash`, because no Haiku provider was reachable from the machine it ran on. That run passed the bar but does not gate the default. The eval scores the wake for your message and the mid-task wakes: what on mode delivers is the same pick set, with the same injection guard, rendered by moraebot. `mid_task` is off by default; turning `"on"` on by default is gated the same way, on the same Haiku run.
+If it misses the bar, set `memory.recall.mode = "shadow"` (picks only logged) or a better `memory.recall.model`.
 
 ## Adding a case
 
@@ -121,7 +123,6 @@ Bucket names are:
 - `owner`
 - `boundaries`
 - `self_obs`
-- `self`
 
 Each entry has these fields:
 

@@ -3,8 +3,13 @@
 //! The lead child is never closed because the next input belongs to another
 //! conversation: each input names its own conversation (see `lead`), and the reply
 //! stays with the row that asked. Before every turn `persona.md`, the core memory
-//! (`memory::core_block`) and the self readings (`memory::self_block`) are read again; when the lead's appended system prompt changed, the idle child is closed and started again on
-//! the same session. An owner row's input gets its conversation's memory sections appended
+//! (`memory::core_block`) are read again. The
+//! child keeps the appended system prompt it started with ("pinned", see `pin`): a change goes
+//! into its next input as one update block (`pin::update_notice`, once per change), and the idle
+//! child is closed and started again on the same session only when the provider's prompt cache
+//! is cold anyway (idle for `lead.cache_minutes`, a compaction since it started, or the owner's
+//! refresh command; `cache_minutes = 0` restarts on any change). An owner row's input gets its
+//! conversation's memory sections appended
 //! after the body when they changed since this child last got them (`thread_memory`); with
 //! `memory.recall.mode = "on"` the recall advisor's picks follow as one guarded block
 //! (`recall::recalled_block`), after a wait of at most `memory.recall.wait_ms`.
@@ -69,9 +74,6 @@ pub const CORE_MEMORY_OPEN: &str = "<<<moraebot-memory core>>>";
 pub const CORE_MEMORY_CLOSE: &str = "<<<end>>>";
 /// The largest delimited core memory block, delimiters included, in bytes.
 pub const CORE_MEMORY_CAP_BYTES: usize = memory::DEFAULT_CORE_CAP_BYTES;
-/// The line above the self block (#59) in the lead's system prompt; it closes with
-/// [`CORE_MEMORY_CLOSE`].
-pub const SELF_MEMORY_OPEN: &str = "<<<moraebot-memory self>>>";
 
 /// The omp process could not be started or did not become ready.
 pub const E_OMP_SPAWN: &str = "E_OMP_SPAWN";
@@ -99,6 +101,17 @@ pub const W_LEAD_BUSY: &str = "W_LEAD_BUSY";
 /// Log code: the owner's new-session command gave the lead an empty session (#74); the line
 /// carries the old session's backup folder.
 pub const I_LEAD_NEW_SESSION: &str = "I_LEAD_NEW_SESSION";
+/// Log code: the lead child is closed between turns to be started again with its current
+/// appended system prompt; the line carries the reason (`memory_idle`, `memory_compacted`,
+/// `memory_requested`, `unpinned`).
+pub const I_LEAD_RESTART: &str = "I_LEAD_RESTART";
+/// Log code: one lead turn ended; the line carries the tokens its assistant messages reported
+/// (input, output, cache read, cache write).
+pub const I_LEAD_USAGE: &str = "I_LEAD_USAGE";
+/// The store flag that keeps [`Live::outside`] over lead restarts until a new session.
+const OUTSIDE_FLAG: &str = "lead_outside_text";
+/// How many recent lead turns [`OmpManager::lead_cache`] sums.
+pub const USAGE_TURNS: usize = 20;
 /// The lead's session folder could not be moved aside for a new session; the lead keeps it.
 pub const E_LEAD_NEW_SESSION: &str = "E_LEAD_NEW_SESSION";
 /// Warn log code: a running lead or lane turn showed no progress for `omp.stall_after_minutes`.
@@ -843,8 +856,9 @@ impl LeadNotes {
     }
 }
 
-/// Feeds the running owner turn's tool events to the recall advisor's mid-task state (in the
-/// open turn) from the lead's event drain, and starts the mid wakes it decides on.
+/// Feeds the running owner turn's lead events (tool calls, assistant text) to the recall
+/// advisor's mid-task state (in the open turn) from the lead's event drain, and starts the mid
+/// wakes it decides on, in the lead context of that moment.
 struct MidTap {
     advisor: Arc<Advisor>,
     runtime: tokio::runtime::Handle,
@@ -856,6 +870,7 @@ impl MidTap {
         let Event::Notification(RpcNotification::RpcAgentEvent(agent)) = event else {
             return;
         };
+        let said: String;
         let tool = match agent {
             RpcAgentEvent::ToolExecutionStart(start) => ToolEvent::Start {
                 call: &start.tool_call_id,
@@ -868,9 +883,25 @@ impl MidTap {
                 result: end.result.as_ref(),
                 error: end.is_error == Some(true),
             },
+            RpcAgentEvent::MessageEnd(end) => {
+                let omp_rpc::AgentMessage::Assistant(message) = &end.message else {
+                    return;
+                };
+                said = message
+                    .content
+                    .iter()
+                    .flatten()
+                    .filter_map(|part| match part {
+                        omp_rpc::AssistantContent::Text(text) => text.text.as_deref(),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                ToolEvent::Said { text: &said }
+            }
             _ => return,
         };
-        let wake = {
+        let (wake, turn) = {
             let mut gate = lock(gate);
             let Some(turn) = gate.as_mut() else {
                 return;
@@ -879,14 +910,27 @@ impl MidTap {
             let Some(mid) = turn.mid.as_mut() else {
                 return;
             };
-            self.advisor
-                .mid_event(mid, tool, Instant::now())
-                .map(|wake| (wake, id))
+            let Some(mut wake) = self.advisor.mid_event(mid, tool, Instant::now()) else {
+                return;
+            };
+            // The lead context now: a compaction since the turn started changes what it holds.
+            let given = lock(&turn.given);
+            let mut held: HashSet<String> = given
+                .sections
+                .values()
+                .flat_map(|sections| sections.keys().cloned())
+                .collect();
+            if given.epoch == turn.main_epoch
+                && let Some((_, sections)) = &turn.main_fresh
+            {
+                held.extend(sections.iter().map(|(label, _)| label.clone()));
+            }
+            wake.wake.epoch = given.epoch;
+            wake.wake.given = held;
+            (wake, id)
         };
-        if let Some((wake, turn)) = wake {
-            self.advisor
-                .mid_wake(&self.runtime, wake, turn, self.notes.clone());
-        }
+        self.advisor
+            .mid_wake(&self.runtime, wake, turn, self.notes.clone());
     }
 }
 
@@ -941,9 +985,99 @@ struct GivenState {
     /// Per conversation key, per memory bucket label: the hash of the bucket's section last
     /// put into that conversation's lead input that the child took.
     sections: HashMap<String, HashMap<String, u64>>,
+    /// The update block (`pin::update_notice` against the pinned text) the child holds;
+    /// unknown after a compaction with one held, and on a resumed session.
+    update: crate::pin::Held,
     /// Counts the child's context compactions ([`note_compaction`]): an input built before
-    /// one is not recorded after it.
+    /// one is not recorded after it. Above 0, the provider's prompt cache is cold anyway.
     epoch: u64,
+}
+
+/// Token counts reported by the assistant messages of lead turns (omp's `message_end`
+/// usage).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TokenUsage {
+    /// Input tokens not read from or written to the prompt cache.
+    pub input: u64,
+    pub output: u64,
+    pub cache_read: u64,
+    pub cache_write: u64,
+}
+
+impl TokenUsage {
+    fn add_usage(&mut self, usage: &omp_rpc::Usage) {
+        let count = |n: Option<i64>| n.and_then(|n| u64::try_from(n).ok()).unwrap_or(0);
+        self.input += count(usage.input);
+        self.output += count(usage.output);
+        self.cache_read += count(usage.cache_read);
+        self.cache_write += count(usage.cache_write);
+    }
+
+    fn add(&mut self, other: &TokenUsage) {
+        self.input += other.input;
+        self.output += other.output;
+        self.cache_read += other.cache_read;
+        self.cache_write += other.cache_write;
+    }
+
+    /// The share of prompt tokens read from the cache, in whole percent; `None` without any
+    /// prompt token.
+    pub fn hit_percent(&self) -> Option<u64> {
+        let prompt = self.input + self.cache_read + self.cache_write;
+        (prompt > 0).then(|| self.cache_read * 100 / prompt)
+    }
+}
+
+/// The lead's cache measurements ([`OmpManager::lead_cache`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LeadCache {
+    /// How many recent turns `recent` sums (at most [`USAGE_TURNS`]).
+    pub turns: usize,
+    /// The tokens of those turns.
+    pub recent: TokenUsage,
+    /// When the lead child was last closed to be started again, and why (an
+    /// [`I_LEAD_RESTART`] reason, `lost` or `new_session`).
+    pub last_restart: Option<(std::time::SystemTime, &'static str)>,
+    /// The current appended system prompt differs from the one the live child was started
+    /// with: the change waits (as an update block) for the next restart.
+    pub memory_waiting: bool,
+}
+
+/// Usage counts and restarts of the lead.
+#[derive(Debug, Default)]
+struct LeadMetrics {
+    /// The sums of the last [`USAGE_TURNS`] turns, oldest first.
+    recent: std::collections::VecDeque<TokenUsage>,
+    last_restart: Option<(std::time::SystemTime, &'static str)>,
+    /// The appended system prompt of the live child; `None` while none runs.
+    pinned: Option<String>,
+}
+
+/// The usage of one lead turn: every assistant `message_end` its main prompt, its owner steer
+/// and its notes saw, from submission to their `prompt_result` (the client collects them in
+/// order, so none is missed or counted for the next turn). A run that answered several of
+/// them shows up in each; it is counted once (same message, field for field). Nothing for a
+/// prompt that failed before its result.
+#[derive(Default)]
+struct TurnUsage {
+    sum: TokenUsage,
+    seen: HashSet<String>,
+}
+
+impl TurnUsage {
+    fn add(&mut self, turn: &Result<PromptTurn, RpcError>) {
+        for event in turn.iter().flat_map(|turn| &turn.events) {
+            if let RpcAgentEvent::MessageEnd(end) = event
+                && let omp_rpc::AgentMessage::Assistant(message) = &end.message
+                && let Some(usage) = &message.usage
+                && self
+                    .seen
+                    .insert(serde_json::to_string(message).unwrap_or_default())
+            {
+                self.sum.add_usage(usage);
+            }
+        }
+    }
 }
 
 /// Forgets what the lead child was given when omp reports a compaction of its context
@@ -963,6 +1097,7 @@ fn note_compaction(given: &Given, event: &Event) {
     if compacted {
         let mut given = lock(given);
         given.sections.clear();
+        given.update = given.update.forgotten();
         given.epoch += 1;
         tracing::info!("omp compacted the lead's context; its memory sections go in again");
     }
@@ -1097,8 +1232,14 @@ struct Live {
     settled: bool,
     /// The memory sections this child was given, per conversation; cleared by a compaction.
     given: Given,
-    /// The child has used a tool that may read outside text (see [`TurnContext`]).
+    /// The child, or an earlier child of this session, has used a tool that may read outside
+    /// text (see [`TurnContext`]); kept in the store ([`OUTSIDE_FLAG`]) over restarts.
     outside: Arc<AtomicBool>,
+    /// `outside` is already set in the store.
+    outside_saved: bool,
+    /// When the last turn ended (or the child started): the provider's prompt cache of this
+    /// child is cold once it sat idle for the cache window.
+    idle_since: Instant,
     /// This child's lead generation ([`Store::next_lead_generation`]); `None` when the store
     /// could not count it (the recall advisor then skips this child's turns).
     generation: Option<i64>,
@@ -1145,6 +1286,21 @@ pub struct OmpManager {
     /// How long a lead turn may keep an owner message waiting before its busy note; `None`
     /// when `lead.handoff_after_minutes = 0`.
     handoff_after: Option<Duration>,
+    /// How long the lead keeps its pinned system prompt while idle; `None` with
+    /// `lead.cache_minutes = 0` (restart on any change).
+    cache_window: Option<Duration>,
+    /// The owner asked to set the lead's system prompt again before its next turn.
+    refresh: AtomicBool,
+    /// The persona file's refusal code last logged; logged again only when it changes.
+    persona_refused: Mutex<Option<&'static str>>,
+    /// What the last lead child started in this process was given; a later child of the same
+    /// session holds the update blocks it held.
+    last_given: Mutex<Option<Given>>,
+    /// The text the last lead child had pinned when it was lost: its successor starts with it
+    /// (the session still holds what it was given), so the usual restart rules apply.
+    lost_append: Mutex<Option<String>>,
+    /// Token usage and restarts of the lead.
+    metrics: Arc<Mutex<LeadMetrics>>,
     lead_watch: Arc<Mutex<LeadWatch>>,
     /// The last attempt to start the lead child failed and none has succeeded since.
     lead_down: AtomicBool,
@@ -1194,6 +1350,12 @@ impl OmpManager {
         Self {
             stall_after: config.omp.stall_after(),
             handoff_after: config.lead.handoff_after(),
+            cache_window: config.lead.cache_window(),
+            refresh: AtomicBool::new(false),
+            persona_refused: Mutex::default(),
+            last_given: Mutex::default(),
+            lost_append: Mutex::default(),
+            metrics: Default::default(),
             lead_down: AtomicBool::new(false),
             config,
             store,
@@ -1228,6 +1390,13 @@ impl OmpManager {
         Arc::get_mut(&mut self.lanes)
             .expect("lane manager not shared yet")
             .turn_timeout = timeout;
+        self
+    }
+
+    /// Overrides `lead.cache_minutes` (tests use `Duration::ZERO` for a lead that is always
+    /// past the window); `None` restarts the lead on any change.
+    pub fn with_cache_window(mut self, window: Option<Duration>) -> Self {
+        self.cache_window = window;
         self
     }
 
@@ -1286,6 +1455,10 @@ impl OmpManager {
     /// Gives the lead `memory_write`, which queues entries for `memory`'s worker. The lead
     /// always has `memory_search`; lanes never get `memory_write`.
     pub fn with_memory(mut self, memory: memory::MemoryHandle) -> Self {
+        // The lane manager is first shared when the lead child starts.
+        Arc::get_mut(&mut self.lanes)
+            .expect("lane manager not shared yet")
+            .outcome_memory = Some(memory.clone());
         self.memory = Some(memory);
         self
     }
@@ -1477,25 +1650,52 @@ impl OmpManager {
     /// with the files queued by `send_file` during it. An owner row's input gets its
     /// conversation's changed memory sections appended (`thread_memory`). One lead turn runs at a time. The child is closed
     /// when an outcome is `NeedsCheck` (timeout or lost child), or before a turn when the
-    /// lead's appended system prompt changed and the last turn's session settled.
+    /// lead's appended system prompt changed, the last turn's session settled and the prompt
+    /// cache is cold ([`Self::restart_reason`]). Otherwise a changed prompt reaches the child as
+    /// one update block after the memory sections (`pin::update_notice`), and a prompt back to
+    /// the pinned text as one revert block (`pin::revert_notice`).
     pub async fn prompt(&self, key: &str, row_id: i64, sender: Sender, text: &str) -> GroupReport {
         let mut live = self.live.lock().await;
         // Between turns: the live mutex is held, so no turn or steer is open here.
         let (append, refused) = self.lead_append();
-        if let Some(old) = live.take_if(|current| current.settled && current.append != append) {
-            tracing::info!("lead system prompt changed; restarting the omp lead between turns");
+        {
+            let mut logged = lock(&self.persona_refused);
+            if *logged != refused {
+                if let Some(code) = refused {
+                    tracing::warn!(code, "persona file not used");
+                }
+                *logged = refused;
+            }
+        }
+        let requested = self.refresh.load(Ordering::Relaxed);
+        let reason = live
+            .as_ref()
+            .and_then(|current| self.restart_reason(current, &append, requested));
+        if let Some(reason) = reason
+            && let Some(old) = live.take()
+        {
+            tracing::info!(
+                code = I_LEAD_RESTART,
+                reason,
+                "lead system prompt changed; restarting the omp lead between turns"
+            );
             old.close(&self.lead_kill).await;
+            self.note_restart(reason);
+        }
+        if live.as_ref().is_none_or(|current| current.settled) {
+            // Served: a settled child holds the current prompt or takes it as an update.
+            self.refresh.store(false, Ordering::Relaxed);
         }
         if live.is_none() {
-            if let Some(code) = refused {
-                tracing::warn!(code, "persona file not used");
-            }
-            match self.start(append).await {
+            let lost = lock(&self.lost_append).take();
+            let pinned = lost.clone().unwrap_or_else(|| append.clone());
+            match self.start(pinned).await {
                 Ok(started) => {
                     self.lead_down.store(false, Ordering::Relaxed);
                     *live = Some(started);
                 }
                 Err(outcome) => {
+                    *lock(&self.lost_append) = lost;
                     self.lead_down.store(true, Ordering::Relaxed);
                     return GroupReport {
                         main: TurnReport::without_files(outcome),
@@ -1517,7 +1717,7 @@ impl OmpManager {
         });
         lock(&self.lead_watch).begin(key, Instant::now());
         self.tool_starts.clear();
-        let (input, fresh, epoch, held) = {
+        let (input, fresh, epoch, held, update) = {
             let given = lock(&current.given);
             let (input, fresh) = thread_memory(
                 &self.config.memory_dir(),
@@ -1530,7 +1730,12 @@ impl OmpManager {
                 .values()
                 .flat_map(|sections| sections.keys().cloned())
                 .collect();
-            (input, fresh, given.epoch, held)
+            let update = crate::pin::next_notice(&current.append, &append, given.update);
+            (input, fresh, given.epoch, held, update)
+        };
+        let input = match &update {
+            Some((block, _)) => append_block(input, block),
+            None => input,
         };
         let wake =
             self.recall
@@ -1542,13 +1747,31 @@ impl OmpManager {
                         recall_wake(text, row_id, generation, epoch, held, &fresh)?,
                     ))
                 });
+        // Given out before the recall: a late owner pick is steered into this very turn
+        // while it runs.
+        let turn_id = TurnId(self.turns.fetch_add(1, Ordering::Relaxed) + 1);
+        let shown = crate::recall::Shown::default();
         // On mode: before the turn, waiting at most `wait_ms`; the steer gate is still closed,
         // so a second owner message meanwhile queues as usual (moraedang's point 7 on #59).
         let (input, recalled) = match wake {
             Some((advisor, wake)) if advisor.injects() => {
-                let picks = advisor.recall(wake.clone(), advisor.wait()).await;
-                let (block, shown) = advisor.render(&picks);
-                (append_block(input, &block), Some((advisor, wake, shown)))
+                let picks = advisor
+                    .recall(
+                        wake.clone(),
+                        advisor.wait(),
+                        turn_id,
+                        self.notes(),
+                        Arc::clone(&shown),
+                    )
+                    .await;
+                let (block, held) = advisor.render(&picks);
+                let cut: Vec<_> = picks
+                    .into_iter()
+                    .filter(|pick| !held.iter().any(|h| h.entry.id == pick.entry.id))
+                    .collect();
+                advisor.release(&wake, &cut);
+                lock(&shown).extend(held.iter().map(|pick| pick.entry.id.clone()));
+                (append_block(input, &block), Some((advisor, wake, held)))
             }
             wake => {
                 // Shadow mode wakes after the send below.
@@ -1565,12 +1788,12 @@ impl OmpManager {
         };
         let mid = recalled
             .as_ref()
-            .and_then(|(advisor, wake, shown)| advisor.mid_turn(wake, shown, Instant::now()));
+            .and_then(|(advisor, wake, _)| advisor.mid_turn(wake, Arc::clone(&shown)));
         let _gate_close = GateClose(&self.gate);
         let sent = {
             let mut gate = lock(&self.gate);
             *gate = Some(OpenTurn {
-                id: TurnId(self.turns.fetch_add(1, Ordering::Relaxed) + 1),
+                id: turn_id,
                 key: key.to_owned(),
                 main_row_id: row_id,
                 sender,
@@ -1603,14 +1826,21 @@ impl OmpManager {
             .map(|turn| (turn.steer, turn.notes))
             .unwrap_or_default();
         let main_timed_out = matches!(main, Err(RpcError::Timeout { .. }));
+        let mut usage = TurnUsage::default();
+        usage.add(&main);
         let mut settled = turn_settled(&main);
         let main = map_result(main);
         // Only an input the child took is given: a rejected prompt never reached it.
         if sent && !rejected(&main) {
             record_given(&current.given, fresh, epoch);
+            if let Some((_, given_update)) = update {
+                record_update(&current.given, given_update, epoch);
+            }
             if let Some((advisor, wake, shown)) = &recalled {
                 advisor.delivered(wake, shown);
             }
+        } else if let Some((advisor, wake, shown)) = &recalled {
+            advisor.release(wake, shown);
         }
 
         let mut killed = false;
@@ -1626,11 +1856,14 @@ impl OmpManager {
                     // Never let the child outlive the turn limit by waiting for the steer.
                     self.kill_lead();
                     killed = true;
-                    map_result(result.await.unwrap_or(Err(RpcError::Closed)))
+                    let turn = result.await.unwrap_or(Err(RpcError::Closed));
+                    usage.add(&turn);
+                    map_result(turn)
                 } else {
                     match tokio::time::timeout(self.turn_timeout, &mut result).await {
                         Ok(turn) => {
                             let turn = turn.unwrap_or(Err(RpcError::Closed));
+                            usage.add(&turn);
                             settled &= turn_settled(&turn);
                             map_result(turn)
                         }
@@ -1661,11 +1894,14 @@ impl OmpManager {
                     self.kill_lead();
                     killed = true;
                 }
-                map_result(result.await.unwrap_or(Err(RpcError::Closed)))
+                let turn = result.await.unwrap_or(Err(RpcError::Closed));
+                usage.add(&turn);
+                map_result(turn)
             } else {
                 match tokio::time::timeout(self.turn_timeout, &mut result).await {
                     Ok(turn) => {
                         let turn = turn.unwrap_or(Err(RpcError::Closed));
+                        usage.add(&turn);
                         settled &= turn_settled(&turn);
                         map_result(turn)
                     }
@@ -1686,11 +1922,18 @@ impl OmpManager {
             }
         }
         let files = take_sent(&current.sent_files);
+        self.end_usage(usage.sum);
 
         let lost = killed
             || matches!(main, Outcome::NeedsCheck { .. })
             || matches!(steered, Some((_, Outcome::NeedsCheck { .. })));
+        if let Some(current) = live.as_mut() {
+            self.save_outside(current);
+        }
         if lost && let Some(current) = live.take() {
+            // The next child starts with the text this one had pinned: the usual restart rules,
+            // not the loss, decide when a changed memory text takes over.
+            *lock(&self.lost_append) = Some(current.append.clone());
             tracing::warn!(
                 conversation = %key,
                 row = row_id,
@@ -1698,10 +1941,12 @@ impl OmpManager {
                 "closing omp lead child"
             );
             current.close(&self.lead_kill).await;
+            self.note_restart("lost");
         }
         if let Some(current) = live.as_mut() {
             // A pending background job may still wake this session; restart only once it settled.
             current.settled = settled;
+            current.idle_since = Instant::now();
         }
         let (tools, task) = lock(&self.turn)
             .take()
@@ -1803,6 +2048,7 @@ impl OmpManager {
         self.lanes.shutdown_all().await;
         if let Some(live) = self.live.lock().await.take() {
             live.abort(&self.lead_kill).await;
+            lock(&self.metrics).pinned = None;
         }
     }
 
@@ -1810,7 +2056,8 @@ impl OmpManager {
     /// between turns: it waits for the `live` mutex, so a running turn ends first. The lead child
     /// is closed (and reaped) with [`Live::close`], then `<home>/lead/session` is renamed to a
     /// free `session-backup-<UTC time>` folder beside it (never deleted) and the lead's session
-    /// row is cleared. `live` stays empty, so the next [`Self::prompt`] starts a child through
+    /// row is cleared, and so is the outside-text flag (the new session has read nothing). `live`
+    /// stays empty, so the next [`Self::prompt`] starts a child through
     /// [`Self::start`] as after any restart, with a new lead generation. Lanes, chat children,
     /// the recall advisor and the memory are not touched. Returns the backup folder (`None` when
     /// there was no session folder); a folder that cannot be moved is an error and the next
@@ -1819,7 +2066,10 @@ impl OmpManager {
         let mut live = self.live.lock().await;
         if let Some(old) = live.take() {
             old.close(&self.lead_kill).await;
+            self.note_restart("new_session");
         }
+        // A new session holds nothing: its child starts with the current text.
+        lock(&self.lost_append).take();
         let session_dir = lead_session_dir(&self.config);
         let backup = if std::fs::symlink_metadata(&session_dir).is_ok() {
             let backup = crate::new_session::backup_dir(&session_dir, std::time::SystemTime::now());
@@ -1832,6 +2082,12 @@ impl OmpManager {
         if let Err(e) = lock(&self.store).clear_session_id(lead::LEAD_SESSION) {
             tracing::warn!(code = e.code(), "the lead's old session id was not cleared");
         }
+        if let Err(e) = lock(&self.store).set_flag(OUTSIDE_FLAG, false) {
+            tracing::warn!(
+                code = e.code(),
+                "the lead's outside-text flag was not cleared"
+            );
+        }
         tracing::info!(
             code = I_LEAD_NEW_SESSION,
             backup = ?backup,
@@ -1840,19 +2096,119 @@ impl OmpManager {
         Ok(backup)
     }
 
+    /// The owner's refresh command: the lead's system prompt is set again before its next
+    /// turn (a restart on the same session) when it differs from the one the child started
+    /// with. A turn that is still running is not touched.
+    pub fn refresh_memory(&self) {
+        self.refresh.store(true, Ordering::Relaxed);
+    }
+
+    /// The lead's prompt cache measurements over the last [`USAGE_TURNS`] turns, for the status
+    /// answer. `memory_waiting` reads the persona and core memory now.
+    pub fn lead_cache(&self) -> LeadCache {
+        let (turns, recent, last_restart, pinned) = {
+            let metrics = lock(&self.metrics);
+            let mut recent = TokenUsage::default();
+            for turn in &metrics.recent {
+                recent.add(turn);
+            }
+            (
+                metrics.recent.len(),
+                recent,
+                metrics.last_restart,
+                metrics.pinned.clone(),
+            )
+        };
+        let memory_waiting = pinned.is_some_and(|pinned| pinned != self.lead_append().0);
+        LeadCache {
+            turns,
+            recent,
+            last_restart,
+            memory_waiting,
+        }
+    }
+
+    /// Why the settled `current` child should be closed before the next turn to be started
+    /// again with `append`, or `None` to keep it (the change then goes in as an update block).
+    /// Only when the text differs, and only when the provider's prompt cache is cold anyway:
+    /// the owner asked (`requested`), any change restarts (`cache_minutes = 0`), the child's
+    /// context was compacted, or it sat idle for the cache window.
+    fn restart_reason(
+        &self,
+        current: &Live,
+        append: &str,
+        requested: bool,
+    ) -> Option<&'static str> {
+        if !current.settled || current.append == append {
+            return None;
+        }
+        let Some(window) = self.cache_window else {
+            return Some(if requested {
+                "memory_requested"
+            } else {
+                "unpinned"
+            });
+        };
+        if requested {
+            Some("memory_requested")
+        } else if lock(&current.given).epoch > 0 {
+            Some("memory_compacted")
+        } else if current.idle_since.elapsed() >= window {
+            Some("memory_idle")
+        } else {
+            None
+        }
+    }
+
+    /// Remembers that the lead child was closed now for `reason`.
+    fn note_restart(&self, reason: &'static str) {
+        let mut metrics = lock(&self.metrics);
+        metrics.last_restart = Some((std::time::SystemTime::now(), reason));
+        metrics.pinned = None;
+    }
+
+    /// Logs a finished turn's usage and keeps it among the recent turns.
+    fn end_usage(&self, turn: TokenUsage) {
+        let mut metrics = lock(&self.metrics);
+        tracing::info!(
+            code = I_LEAD_USAGE,
+            input = turn.input,
+            output = turn.output,
+            cache_read = turn.cache_read,
+            cache_write = turn.cache_write,
+            "lead turn usage"
+        );
+        if metrics.recent.len() == USAGE_TURNS {
+            metrics.recent.pop_front();
+        }
+        metrics.recent.push_back(turn);
+    }
+
+    /// Keeps the child's outside-text flag in the store once it is set, so a restarted child
+    /// of the same session starts with it.
+    fn save_outside(&self, current: &mut Live) {
+        if current.outside_saved || !current.outside.load(Ordering::Relaxed) {
+            return;
+        }
+        match lock(&self.store).set_flag(OUTSIDE_FLAG, true) {
+            Ok(()) => current.outside_saved = true,
+            Err(e) => tracing::warn!(
+                code = e.code(),
+                "the lead's outside-text flag was not saved"
+            ),
+        }
+    }
+
     /// The lead's appended system prompt: the hints, then `persona.md` read now, then the core
     /// memory read now. A refused persona file is left out and its code is returned, so the
-    /// caller logs it once per start; core memory problems are logged by `memory::core_block`.
+    /// caller logs it when it changes; core memory problems are logged by `memory::core_block`.
     fn lead_append(&self) -> (String, Option<&'static str>) {
         let (text, refused) = match persona::load(&self.config.home) {
             Ok(p) => (persona::append(&self.hints, p.as_deref()), None),
             Err(e) => (self.hints.clone(), Some(e.code)),
         };
         let (root, today) = (self.config.memory_dir(), (self.memory_clock)());
-        let mut text = append_block(text, &core_memory_block(&root, today));
-        if self.config.memory.self_file_on() {
-            text = append_block(text, &self_memory_block(&root, today));
-        }
+        let text = append_block(text, &core_memory_block(&root, today));
         (text, refused)
     }
 
@@ -1912,9 +2268,26 @@ impl OmpManager {
             ));
         }
         let turn = Arc::clone(&self.turn);
-        let given = Given::default();
+        // A resumed session holds the update blocks its earlier child held; what a child of
+        // an earlier process held is unknown.
+        let update = match (&previous_session, lock(&self.last_given).as_ref()) {
+            (None, _) => crate::pin::Held::Nothing,
+            (Some(_), Some(last)) => lock(last).update,
+            (Some(_), None) => crate::pin::Held::Unknown,
+        };
+        let given = Given::new(Mutex::new(GivenState {
+            update,
+            ..GivenState::default()
+        }));
+        *lock(&self.last_given) = Some(Arc::clone(&given));
         let compacted = Arc::clone(&given);
-        let outside = Arc::new(AtomicBool::new(false));
+        // An earlier child of this session may have read outside text; that stays in its
+        // context. A store that cannot tell counts as read.
+        let outside_before = lock(&self.store).flag(OUTSIDE_FLAG).unwrap_or_else(|e| {
+            tracing::warn!(code = e.code(), "the lead's outside-text flag was not read");
+            true
+        });
+        let outside = Arc::new(AtomicBool::new(outside_before));
         let seen = Arc::clone(&outside);
         let lead_kill = Arc::clone(&self.lead_kill);
         let gate = Arc::clone(&self.gate);
@@ -2001,6 +2374,7 @@ impl OmpManager {
             }
         };
         tracing::info!(pid = started.pid, "omp lead child ready");
+        lock(&self.metrics).pinned = Some(append.clone());
         Ok(Live {
             requests,
             worker,
@@ -2009,6 +2383,8 @@ impl OmpManager {
             settled: true,
             given,
             outside,
+            outside_saved: outside_before,
+            idle_since: Instant::now(),
             generation,
         })
     }
@@ -2114,22 +2490,6 @@ pub fn core_memory_block(root: &Path, today: memory::Day) -> String {
     format!("{CORE_MEMORY_OPEN}\n{guard}\n{core}\n{CORE_MEMORY_CLOSE}")
 }
 
-/// The bot's self readings under `root` as of `today` (`self/self.md`), between
-/// [`SELF_MEMORY_OPEN`] and [`CORE_MEMORY_CLOSE`] lines, opened by [`memory::MEMORY_GUARD`] like
-/// every memory block the lead reads, at most [`memory::SELF_CAP_BYTES`] in
-/// all, newest readings first to stay. Entry text is escaped like the core block's. Empty
-/// when there is no reading. It follows the core block, so a change restarts the lead between
-/// turns the same way.
-pub fn self_memory_block(root: &Path, today: memory::Day) -> String {
-    let guard = memory::MEMORY_GUARD;
-    let frame = SELF_MEMORY_OPEN.len() + guard.len() + CORE_MEMORY_CLOSE.len() + 3;
-    let block = memory::self_block(root, today, memory::SELF_CAP_BYTES.saturating_sub(frame));
-    if block.is_empty() {
-        return block;
-    }
-    format!("{SELF_MEMORY_OPEN}\n{guard}\n{block}\n{CORE_MEMORY_CLOSE}")
-}
-
 /// The first line of conversation `key`'s memory block in a lead input.
 pub fn thread_memory_open(key: &str) -> String {
     format!("<<<moraebot-memory thread={key}>>>")
@@ -2212,6 +2572,7 @@ fn recall_wake(
         generation,
         epoch,
         given: held,
+        plan: String::new(),
         events: Vec::new(),
         exclude: HashSet::new(),
     })
@@ -2228,6 +2589,18 @@ fn record_given(given: &Given, fresh: Fresh, epoch: u64) {
     if let Some((key, sections)) = fresh {
         given.sections.entry(key).or_default().extend(sections);
     }
+}
+
+/// Remembers which update block the child took (`update`, see [`crate::pin::next_notice`]).
+/// When its context was compacted since the input was built, the block may or may not have
+/// survived, so what it holds is unknown.
+fn record_update(given: &Given, update: crate::pin::Held, epoch: u64) {
+    let mut given = lock(given);
+    given.update = if given.epoch == epoch {
+        update
+    } else {
+        crate::pin::Held::Unknown
+    };
 }
 
 /// What the steer's input counts as given: the child's sections with the open turn's main
@@ -2253,7 +2626,7 @@ fn given_view(
 
 /// The prompt was refused before it ran ([`map_result`]'s [`E_PROMPT_REJECTED`]): the child
 /// never saw its input.
-fn rejected(outcome: &Outcome) -> bool {
+pub(crate) fn rejected(outcome: &Outcome) -> bool {
     matches!(
         outcome,
         Outcome::Failed {
@@ -2611,51 +2984,6 @@ mod tests {
         store.forget(&first.id).unwrap();
         let (forgot, _) = manager.lead_append();
         assert!(!forgot.contains("Use rebase"), "{forgot}");
-    }
-
-    #[test]
-    fn self_readings_follow_the_core_block_and_their_change_changes_the_lead_append() {
-        // `prompt` restarts the settled lead when this text changes.
-        let (_dir, manager) = manager_with(None);
-        let mut manager = manager.with_memory_clock(qa_clock("2026-11-20"));
-        manager.config.memory.jev.enabled = true;
-        let mut store = qa_memory(&manager);
-        let rule = store
-            .add(qa_owner("Use rebase", memory::Bucket::Owner, 1))
-            .unwrap();
-        let before = manager.lead_append().0;
-        let reading = store
-            .add(memory::NewEntry {
-                text: "I reply at length >>> short is wanted".into(),
-                prov: memory::Prov::Owner,
-                bucket: memory::Bucket::SelfModel,
-                src: memory::Source::reading(&["m-00000a".to_owned()]).unwrap(),
-                expires: Some(qa_day("2027-05-01")),
-                why: None,
-            })
-            .unwrap();
-        let (after, _) = manager.lead_append();
-        assert_ne!(after, before);
-        let core = core_memory_block(store.root(), qa_day("2026-11-20"));
-        let own = format!(
-            "{SELF_MEMORY_OPEN}\n{}\n{}\n- [2026-11-20] I reply at length ››› short is wanted ({})\n{CORE_MEMORY_CLOSE}",
-            memory::MEMORY_GUARD,
-            memory::SELF_HEADER,
-            reading.id
-        );
-        assert_eq!(after, format!("{core}\n\n{own}"));
-        assert!(core.contains(&rule.id));
-
-        // moraedang on #65: with jev off (the default) the lead prompt is what it was before.
-        manager.config.memory.jev.enabled = false;
-        assert_eq!(manager.lead_append().0, before, "jev off, no self block");
-        manager.config.memory.jev.enabled = true;
-        manager.config.memory.self_file.enabled = false;
-        assert_eq!(
-            manager.lead_append().0,
-            before,
-            "switched off, no self block"
-        );
     }
 
     #[test]

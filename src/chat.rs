@@ -12,7 +12,8 @@
 //! folder `<home>/chat/cwd/<turn>` (made fresh for the turn and removed after it),
 //! with the overlay `<home>/chat/omp-chat.yml` ([`CHAT_OVERLAY`]) that turns off every
 //! config discovery source (so no MCP server, plugin, hook or skill), memory, lesson
-//! capture and the advisor, and with no host tools (no `set_host_tools`). Before the
+//! capture, the advisor and omp's Auto-QA (its `report_issue` tool comes even with
+//! `--no-tools`), and with no host tools (no `set_host_tools`). Before the
 //! prompt the child's own tool list is read (`get_state`): any tool refuses the turn
 //! ([`E_CHAT_TOOLS`]).
 //!
@@ -93,6 +94,8 @@ autolearn:
   enabled: false
 advisor:
   enabled: false
+dev:
+  autoqa: false
 ";
 
 /// Appended to the chat child's system prompt.

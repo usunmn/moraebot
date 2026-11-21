@@ -816,3 +816,29 @@ fn envelope_line_is_not_echoed() {
         .expect("logged prompt frame");
     assert_eq!(first["message"], envelope);
 }
+
+/// The locked children's overlay turns omp's Auto-QA tool off: with it `get_state` lists no
+/// tool; without its `dev: autoqa: false` lines (or without any overlay) it lists
+/// `report_issue`, and moraebot would refuse the child.
+#[test]
+fn the_locked_overlay_turns_off_the_auto_qa_tool() {
+    use omp_rpc::GetStateCommand;
+    let dir = tempfile::tempdir().unwrap();
+    let tools = |overlay: Option<&str>| -> Vec<String> {
+        let path = dir.path().join("overlay.yml");
+        let mut args = Vec::new();
+        if let Some(text) = overlay {
+            std::fs::write(&path, text).unwrap();
+            args = vec!["--config", path.to_str().unwrap()];
+        }
+        let (client, _events) = spawn_env(&args, &[], Vec::new());
+        let state = client.call(&GetStateCommand {}).expect("get_state");
+        state.dump_tools.into_iter().map(|t| t.name).collect()
+    };
+    let overlay = moraebot::chat::CHAT_OVERLAY;
+    assert!(overlay.contains("dev:\n  autoqa: false\n"));
+    assert_eq!(tools(Some(overlay)), Vec::<String>::new());
+    let without = overlay.replace("dev:\n  autoqa: false\n", "");
+    assert_eq!(tools(Some(&without)), ["report_issue"]);
+    assert_eq!(tools(None), ["report_issue"]);
+}

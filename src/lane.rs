@@ -91,6 +91,7 @@ use crate::omp::{
     self, ABORT_JOIN_BOUND, E_OMP_SPAWN, EMPTY_REPLY, GroupKill, OpenedChild, Outcome, TurnContext,
     lock,
 };
+use crate::outcome;
 use crate::secret;
 use crate::store::{LaneClose, LaneMessage, LaneStart, LaneState, Store};
 use crate::worktree::{self, Cleanup, WorktreeError};
@@ -403,6 +404,20 @@ pub struct LaneManager {
     pub(crate) extra_env: Vec<(OsString, OsString)>,
     /// Today's date for a job's memory block (expired entries are left out).
     pub(crate) memory_clock: memory::Clock,
+    /// Per lane id: the memory block its child was first started with in this process (kept
+    /// in memory only, never read back from `append.md`) and the notice last put in a job
+    /// prompt about a later difference, so the lane's system prompt and cache stay stable.
+    pins: Mutex<HashMap<i64, LanePin>>,
+    /// The memory writer that saves failed lane results ([`crate::outcome`]); `None` saves
+    /// nothing.
+    pub(crate) outcome_memory: Option<memory::MemoryHandle>,
+}
+
+/// The memory block a lane is pinned to and what the lane was last told about it.
+struct LanePin {
+    block: String,
+    /// The update block the lane took last ([`crate::pin::next_notice`]).
+    told: crate::pin::Held,
 }
 
 fn refused(code: &str, reason: &str) -> HostToolError {
@@ -505,6 +520,8 @@ impl LaneManager {
             ticks: watch::channel(None).0,
             extra_env: Vec::new(),
             memory_clock: memory::system_clock(),
+            pins: Mutex::default(),
+            outcome_memory: None,
         }
     }
 
@@ -1303,7 +1320,10 @@ impl LaneManager {
                 .close_lane(id, reason)
                 .map_err(|e| refused(e.code(), &e.to_string()))?
             {
-                LaneClose::Closed { repo } => repo,
+                LaneClose::Closed { repo } => {
+                    lock(&self.pins).remove(&id);
+                    repo
+                }
                 LaneClose::Unknown => return Err(refused(E_LANE_UNKNOWN, "no lane has this id")),
                 LaneClose::Busy => return Err(busy()),
             }
@@ -1653,9 +1673,40 @@ impl LaneManager {
         Ok(json!({"recorded": true}).to_string().into())
     }
 
+    /// Returns the block to start lane `id` with (pinned on its first job in this process) and
+    /// the notice for this job's prompt with what the lane holds once it took it
+    /// ([`crate::pin::next_notice`]); the caller commits that with [`Self::pin_told`]. A lane
+    /// pinned for a job that `resumes` an earlier session may hold an earlier update, so its
+    /// first notice is sent as if what it holds were unknown.
+    fn pin_memory(
+        &self,
+        id: i64,
+        current: String,
+        resumes: bool,
+    ) -> (String, Option<(String, crate::pin::Held)>) {
+        let mut pins = lock(&self.pins);
+        let pin = pins.entry(id).or_insert_with(|| LanePin {
+            block: current.clone(),
+            told: if resumes {
+                crate::pin::Held::Unknown
+            } else {
+                crate::pin::Held::Nothing
+            },
+        });
+        let notice = crate::pin::next_notice(&pin.block, &current, pin.told);
+        (pin.block.clone(), notice)
+    }
+
+    /// Records that lane `id` took the notice [`Self::pin_memory`] returned.
+    fn pin_told(&self, id: i64, told: crate::pin::Held) {
+        if let Some(pin) = lock(&self.pins).get_mut(&id) {
+            pin.told = told;
+        }
+    }
+
     /// `Err` is a failure before the prompt was sent (the child did not open). The child's
-    /// system prompt gets the job's memory block ([`memory::lane_block`]), read now and passed
-    /// as the private file `<home>/lanes/<id>/append.md`.
+    /// system prompt gets the lane's pinned memory block ([`Self::pin_memory`]), passed as the
+    /// private file `<home>/lanes/<id>/append.md`; a later change goes in the job prompt.
     fn run_prompt(
         self: &Arc<Self>,
         job: &Job,
@@ -1673,7 +1724,8 @@ impl LaneManager {
             .as_deref()
             .map(|repo| memory::lane_projects(&memory_dir, repo))
             .unwrap_or_default();
-        let memory = memory::lane_block(&memory_dir, &projects, (self.memory_clock)());
+        let current = memory::lane_block(&memory_dir, &projects, (self.memory_clock)());
+        let (memory, notice) = self.pin_memory(job.id, current, job.previous_session.is_some());
         // Written again before every start: another lane's shell may have edited it.
         crate::omp_overlay::write_overlay(&self.config.home).map_err(|e| Outcome::Failed {
             code: crate::omp_overlay::E_OMP_OVERLAY,
@@ -1753,6 +1805,10 @@ impl LaneManager {
             );
         }
         let mut message = job.text.clone();
+        if let Some((notice, _)) = &notice {
+            message += "\n\n";
+            message += notice;
+        }
         if let Some(line) = &job.done {
             message += &done::lane_footer(line);
         }
@@ -1786,6 +1842,12 @@ impl LaneManager {
                 let (outcome, mut left) =
                     self.drain_steers(&client, steer_rx, &main_rx, &gate, *pid, job.id);
                 untaken.append(&mut left);
+                // Only a prompt the lane took told it the notice.
+                if let Some((_, told)) = notice
+                    && !omp::rejected(&outcome)
+                {
+                    self.pin_told(job.id, told);
+                }
                 outcome
             }
             Err(e) => Outcome::Failed {
@@ -1984,7 +2046,8 @@ impl LaneManager {
             ),
         };
         let text = lead::lane_result(conversation_key, id, &result);
-        match lock(&self.store).finish_lane(id, seq, &text, state, code) {
+        let finished = lock(&self.store).finish_lane(id, seq, &text, state, code);
+        match finished {
             Ok(written) => {
                 tracing::info!(
                     lane = id,
@@ -1993,6 +2056,9 @@ impl LaneManager {
                     code,
                     "lane finished"
                 );
+                if written {
+                    self.remember_outcome(id, seq, &outcome, code);
+                }
                 written
             }
             Err(e) => {
@@ -2004,6 +2070,50 @@ impl LaneManager {
                 );
                 false
             }
+        }
+    }
+
+    /// Saves result `seq` of lane `id` as a reference entry of the lane's project when it
+    /// failed with `code` (error, unmet done check or stop); a successful result saves nothing.
+    fn remember_outcome(&self, id: i64, seq: i64, outcome: &LaneOutcome, code: Option<&str>) {
+        let (Some(memory), Some(code)) = (&self.outcome_memory, code) else {
+            return;
+        };
+        let failure = match outcome {
+            LaneOutcome::Plain(
+                Outcome::Failed { detail, .. } | Outcome::NeedsCheck { detail, .. },
+            ) => outcome::Failure::Error(detail),
+            LaneOutcome::Unmet { receipt, .. } => outcome::Failure::Unmet(receipt),
+            LaneOutcome::Stopped { reason } => outcome::Failure::Stopped(reason),
+            LaneOutcome::Plain(Outcome::Reply(_) | Outcome::NoAgent) | LaneOutcome::Done { .. } => {
+                return;
+            }
+        };
+        let lane = match lock(&self.store).lane(id) {
+            Ok(Some(lane)) => lane,
+            Ok(None) => return,
+            Err(e) => {
+                tracing::warn!(
+                    lane = id,
+                    code = e.code(),
+                    "lane row not read for outcome memory"
+                );
+                return;
+            }
+        };
+        let projects = lane
+            .repo
+            .as_deref()
+            .map(|repo| memory::lane_projects(&self.config.memory_dir(), Path::new(repo)))
+            .unwrap_or_default();
+        let entry = outcome::entry(id, seq, &projects, &lane.task, code, &failure);
+        if let Err(e) = memory.queue_add(entry) {
+            tracing::warn!(
+                lane = id,
+                seq,
+                code = e.code,
+                "lane outcome not saved to memory"
+            );
         }
     }
 }
@@ -2700,6 +2810,103 @@ mod tests {
         assert_eq!(
             lanes[2],
             (LaneState::NeedsCheck, Some(omp::E_CHILD_LOST.to_owned()))
+        );
+    }
+
+    #[tokio::test]
+    async fn only_failed_stopped_or_unmet_lane_results_are_remembered_once() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut m = qa_manager(dir.path());
+        let today = memory::Day::from_ymd(2026, 11, 22).expect("day");
+        let store = memory::MemoryStore::open(
+            &dir.path().join("memory"),
+            memory::Redactor::default(),
+            Arc::new(move || today),
+        )
+        .expect("memory store");
+        let handle = memory::MemoryHandle::spawn(store).expect("spawn");
+        Arc::get_mut(&mut m).expect("not shared").outcome_memory = Some(handle.clone());
+        for (n, task) in [
+            (1, "fix the build\nmore"),
+            (2, "write docs"),
+            (3, "run the migration"),
+            (4, "ship it"),
+        ] {
+            lock(&m.store)
+                .start_lane(&format!("call-{n}"), "discord:th:111", task, None, None, 4)
+                .expect("start lane");
+        }
+        let failed = || {
+            Err(Outcome::Failed {
+                code: omp::E_OMP_SPAWN,
+                detail: "spawn failed\nsecond line".into(),
+            })
+        };
+        {
+            let set = lock(&m.inner);
+            assert!(m.write_result(&set, 1, 1, "discord:th:111", failed()));
+            m.write_result(&set, 1, 1, "discord:th:111", failed());
+            assert!(m.write_result(
+                &set,
+                2,
+                1,
+                "discord:th:111",
+                Ok(LaneOutcome::Plain(Outcome::Reply("done".into())))
+            ));
+            assert!(m.write_result(
+                &set,
+                3,
+                1,
+                "discord:th:111",
+                Ok(LaneOutcome::Stopped {
+                    reason: "owner changed plans\nmore".into()
+                })
+            ));
+            assert!(
+                m.write_result(
+                    &set,
+                    4,
+                    1,
+                    "discord:th:111",
+                    Ok(LaneOutcome::Unmet {
+                        text: "all done, trust me".into(),
+                        receipt:
+                            "evidence: x\n- file a -> ok\n- cmd make test -> E_CHECK_EXIT: exit 2"
+                                .into(),
+                    })
+                )
+            );
+        }
+        // The worker takes jobs in order: once this add is saved, the queued ones are too.
+        handle
+            .add(memory::NewEntry {
+                text: "barrier".into(),
+                prov: memory::Prov::Owner,
+                bucket: memory::Bucket::Owner,
+                src: memory::Source::row(1),
+                expires: None,
+                why: None,
+            })
+            .await
+            .expect("barrier");
+        let saved = handle.entries(&memory::Bucket::General).expect("entries");
+        let mut texts: Vec<&str> = saved.iter().map(|e| e.text.as_str()).collect();
+        texts.sort_unstable();
+        assert_eq!(
+            texts,
+            [
+                format!(
+                    "Lane 1 result failed with {}. Task: fix the build. Error: spawn failed",
+                    omp::E_OMP_SPAWN
+                ),
+                format!(
+                    "Lane 3 result failed with {E_LANE_STOPPED}. Task: run the migration. Stopped: owner changed plans"
+                ),
+                format!(
+                    "Lane 4 result failed with {}. Task: ship it. Failed checks: cmd make test",
+                    done::E_DONE_UNMET
+                ),
+            ]
         );
     }
 }

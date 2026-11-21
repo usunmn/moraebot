@@ -4,15 +4,13 @@
 //! Because of the exclusive lock, nothing else may open the file while a `Store` is
 //! alive: read everything through this API.
 
-use std::collections::BTreeMap;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
-use std::sync::{Arc, mpsc};
+use std::sync::mpsc;
 use std::time::Duration;
 
 use rusqlite::{
-    Connection, ErrorCode, OptionalExtension, Row as SqlRow, Transaction, TransactionBehavior,
-    params,
+    Connection, ErrorCode, OptionalExtension, Row as SqlRow, TransactionBehavior, params,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -261,8 +259,6 @@ pub struct OnboardingRow {
 
 pub struct Store {
     conn: Connection,
-    /// Called after every commit that inserted a memory job ([`Store::set_memory_wake`]).
-    wake: Option<Arc<dyn Fn() + Send + Sync>>,
     /// Dropped after `conn` (fields drop in order), so [`StoreClosed`] resolves only once the
     /// connection and its exclusive lock are gone.
     closed: Option<mpsc::Sender<()>>,
@@ -286,12 +282,8 @@ impl StoreClosed {
 pub const MAX_TRACE_TOOLS: usize = 64;
 /// Longest tool name a [`ToolUse`] keeps, in characters.
 const MAX_TOOL_NAME: usize = 64;
-/// Processing errors (never jev's) after which a memory job is `failed`.
-pub const MAX_JOB_ATTEMPTS: i64 = 3;
-/// How long a memory log row or a settled memory job is kept, in seconds (30 days).
+/// How long a memory log row or a recall ledger row is kept, in seconds (30 days).
 const MEMORY_KEEP_SECONDS: i64 = 30 * 24 * 60 * 60;
-/// Log code of a pending job that expired before it was processed.
-pub const M_JOB_EXPIRED: &str = "M_JOB_EXPIRED";
 
 /// What a tool the lead started may read or touch ([`crate::memory_tools::tool_source`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -349,53 +341,6 @@ pub struct TurnTrace {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum JobKind {
-    Group,
-    Lane,
-    Subagent,
-    Scan,
-}
-
-impl JobKind {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Group => "group",
-            Self::Lane => "lane",
-            Self::Subagent => "subagent",
-            Self::Scan => "scan",
-        }
-    }
-
-    fn parse(s: &str) -> Option<Self> {
-        Some(match s {
-            "group" => Self::Group,
-            "lane" => Self::Lane,
-            "subagent" => Self::Subagent,
-            "scan" => Self::Scan,
-            _ => return None,
-        })
-    }
-}
-
-/// The state a memory job leaves `pending` for.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum JobEnd {
-    Done,
-    Failed,
-    Expired,
-}
-
-impl JobEnd {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Done => "done",
-            Self::Failed => "failed",
-            Self::Expired => "expired",
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LogLevel {
     Info,
     Warn,
@@ -412,109 +357,6 @@ impl LogLevel {
     }
 }
 
-/// One inbox row of a `group` job and its origin, read from the row itself.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct JobRow {
-    pub id: i64,
-    pub origin: String,
-}
-
-/// A settled, failed, interrupted or restart-cut lead turn group: its rows (main row first)
-/// and its trace (`None` only for a group cut by a restart).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct GroupJob {
-    pub rows: Vec<JobRow>,
-    pub trace: Option<TurnTrace>,
-}
-
-/// A lane result: `row` is the inbox row that holds it.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct LaneJob {
-    pub row: i64,
-    pub lane: i64,
-    pub seq: i64,
-}
-
-/// A new or changed subagent output file. `session` is `lead` or `lane:<id>`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SubagentJob {
-    pub path: String,
-    pub session: String,
-    pub task: String,
-    pub sha256: String,
-}
-
-/// The session folder of a closed lane, to scan once.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ScanJob {
-    pub lane: i64,
-}
-
-/// The payload of a memory job, one shape per [`JobKind`]. It never holds message text,
-/// lane text, a reply or tool arguments.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[serde(untagged)]
-pub enum JobPayload {
-    Group(GroupJob),
-    Lane(LaneJob),
-    Subagent(SubagentJob),
-    Scan(ScanJob),
-}
-
-impl JobPayload {
-    pub fn kind(&self) -> JobKind {
-        match self {
-            Self::Group(_) => JobKind::Group,
-            Self::Lane(_) => JobKind::Lane,
-            Self::Subagent(_) => JobKind::Subagent,
-            Self::Scan(_) => JobKind::Scan,
-        }
-    }
-
-    /// Reads a stored payload by its job's kind (the JSON carries no tag).
-    fn parse(kind: JobKind, json: &str) -> serde_json::Result<Self> {
-        Ok(match kind {
-            JobKind::Group => Self::Group(serde_json::from_str(json)?),
-            JobKind::Lane => Self::Lane(serde_json::from_str(json)?),
-            JobKind::Subagent => Self::Subagent(serde_json::from_str(json)?),
-            JobKind::Scan => Self::Scan(serde_json::from_str(json)?),
-        })
-    }
-}
-
-/// What [`Store::pending_memory_jobs`] read: the jobs, and the ids of pending rows whose kind or
-/// payload does not decode.
-#[derive(Debug, Default)]
-pub struct PendingJobs {
-    pub jobs: Vec<MemoryJob>,
-    pub unreadable: Vec<i64>,
-}
-
-/// A pending memory job ([`Store::pending_memory_jobs`]). Times are unix seconds.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MemoryJob {
-    pub id: i64,
-    pub kind: JobKind,
-    /// The group failed, was interrupted, or was cut by a restart.
-    pub partial: bool,
-    pub payload: JobPayload,
-    pub attempts: i64,
-    pub created_at: i64,
-}
-
-/// How one job leaves `pending` ([`Store::settle_memory_jobs`]): its end state and its
-/// log row. `code` is a stable code; `detail` holds ids, counts and paths, never entry text.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Settled {
-    pub id: i64,
-    pub end: JobEnd,
-    pub level: LogLevel,
-    pub code: &'static str,
-    pub omp_version: String,
-    pub jev_model: Option<String>,
-    pub detail: Option<String>,
-}
-
 /// One `memory_log` row ([`Store::memory_log`]). `at` is unix seconds.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LogRow {
@@ -523,7 +365,6 @@ pub struct LogRow {
     pub code: &'static str,
     pub job_id: Option<i64>,
     pub omp_version: Option<String>,
-    pub jev_model: Option<String>,
     pub detail: Option<String>,
 }
 
@@ -554,6 +395,33 @@ impl RecallState {
     }
 }
 
+/// Which advisor wake wrote a `recall_ledger` row: the wake for an owner input, or a mid wake
+/// on the lead's tool events.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecallPhase {
+    Owner,
+    Mid,
+}
+
+impl RecallPhase {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Owner => "owner",
+            Self::Mid => "mid",
+        }
+    }
+
+    /// The phase stored as `text`; anything but `mid` reads as `owner` (rows written before
+    /// the column existed).
+    pub fn parse(text: &str) -> Self {
+        if text == "mid" {
+            Self::Mid
+        } else {
+            Self::Owner
+        }
+    }
+}
+
 /// One `recall_ledger` row. `lead_generation` counts lead starts ([`Store::next_lead_generation`],
 /// persisted, so it never repeats after a restart) and `lead_epoch` the compactions of that
 /// lead child; together they name one lead context. `at` is unix seconds.
@@ -567,13 +435,7 @@ pub struct RecallRow {
     pub lead_epoch: i64,
     pub row_id: Option<i64>,
     pub at: i64,
-}
-
-/// Pending memory jobs ([`Store::memory_backlog`]).
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct Backlog {
-    pub groups: usize,
-    pub other: usize,
+    pub phase: RecallPhase,
 }
 
 const SCHEMA: &str = "
@@ -641,20 +503,6 @@ CREATE TABLE IF NOT EXISTS onboarding(
     started_at TEXT NOT NULL,
     ended_at TEXT
 );
-CREATE TABLE IF NOT EXISTS memory_jobs(
-    id INTEGER PRIMARY KEY,
-    kind TEXT NOT NULL CHECK(kind IN ('group','lane','subagent','scan')),
-    key TEXT NOT NULL,
-    state TEXT NOT NULL DEFAULT 'pending' CHECK(state IN ('pending','done','failed','expired')),
-    partial INTEGER NOT NULL DEFAULT 0,
-    payload TEXT,
-    attempts INTEGER NOT NULL DEFAULT 0,
-    last_error TEXT,
-    created_at INTEGER NOT NULL,
-    updated_at INTEGER NOT NULL,
-    UNIQUE(kind, key)
-);
-CREATE INDEX IF NOT EXISTS memory_jobs_pending ON memory_jobs(state, id);
 CREATE TABLE IF NOT EXISTS memory_log(
     id INTEGER PRIMARY KEY,
     at INTEGER NOT NULL,
@@ -681,22 +529,16 @@ CREATE TABLE IF NOT EXISTS recall_ledger(
     at INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS recall_ledger_at ON recall_ledger(at);
-CREATE TABLE IF NOT EXISTS memory_cursor(
-    path TEXT PRIMARY KEY,
-    size INTEGER NOT NULL,
-    mtime INTEGER NOT NULL,
-    sha256 TEXT NOT NULL,
-    seen_at INTEGER NOT NULL
-);
 ";
 
 /// Tables an older version created and nothing reads any more; `Store::open` drops them.
-/// `memory_notices` held the `[memory] saved ...` lines once posted under replies (#56).
-const DROPPED_TABLES: [&str; 1] = ["memory_notices"];
+/// `memory_notices` held the `[memory] saved ...` lines once posted under replies (#56);
+/// `memory_jobs` and `memory_cursor` fed the removed memory observer.
+const DROPPED_TABLES: [&str; 3] = ["memory_notices", "memory_jobs", "memory_cursor"];
 
 /// Columns added after slice 2 as `(table, column, declaration)`; `Store::open` adds the
 /// missing ones to an older database.
-const ADDED_COLUMNS: [(&str, &str, &str); 11] = [
+const ADDED_COLUMNS: [(&str, &str, &str); 12] = [
     ("inbox", "attachments", "TEXT"),
     ("inbox", "files_ready", "INTEGER NOT NULL DEFAULT 1"),
     ("inbox", "out_files", "TEXT"),
@@ -708,74 +550,25 @@ const ADDED_COLUMNS: [(&str, &str, &str); 11] = [
     ("lanes", "repo", "TEXT"),
     ("lanes", "closed_at", "TEXT"),
     ("lanes", "close_reason", "TEXT"),
+    ("recall_ledger", "phase", "TEXT NOT NULL DEFAULT 'owner'"),
 ];
 
 const NOW: &str = "strftime('%Y-%m-%dT%H:%M:%fZ','now')";
-/// The current time in unix seconds, for the `memory_*` tables.
-const NOW_UNIX: &str = "CAST(strftime('%s','now') AS INTEGER)";
 
 fn insert_log(conn: &Connection, row: &LogRow) -> rusqlite::Result<()> {
     conn.execute(
-        "INSERT INTO memory_log(at, level, code, job_id, omp_version, jev_model, detail)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        "INSERT INTO memory_log(at, level, code, job_id, omp_version, detail)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
         params![
             row.at,
             row.level.as_str(),
             row.code,
             row.job_id,
             row.omp_version,
-            row.jev_model,
             row.detail
         ],
     )?;
     Ok(())
-}
-
-/// Inserts one pending memory job; an existing `(kind, key)` changes nothing. Returns whether
-/// a row was inserted. `created_at` is `now`, or the database's clock when `None`.
-fn insert_job(
-    tx: &Transaction,
-    key: &str,
-    partial: bool,
-    payload: &JobPayload,
-    now: Option<i64>,
-) -> rusqlite::Result<bool> {
-    let json = serde_json::to_string(payload)
-        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
-    let at = now.map_or_else(|| NOW_UNIX.to_owned(), |now| now.to_string());
-    Ok(tx.execute(
-        &format!(
-            "INSERT INTO memory_jobs(kind, key, partial, payload, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, {at}, {at})
-             ON CONFLICT(kind, key) DO NOTHING"
-        ),
-        params![payload.kind().as_str(), key, partial, json],
-    )? != 0)
-}
-
-/// Inserts the `group` job for `ids` (main row first), keyed by the main row. Origins are
-/// read here, from the inbox rows, in the caller's transaction, so no caller can pass a
-/// wrong one.
-fn enqueue_group(
-    tx: &Transaction,
-    ids: &[i64],
-    partial: bool,
-    trace: Option<&TurnTrace>,
-) -> rusqlite::Result<bool> {
-    let Some(main) = ids.first() else {
-        return Ok(false);
-    };
-    let mut rows = Vec::with_capacity(ids.len());
-    for &id in ids {
-        let origin: String =
-            tx.query_row("SELECT origin FROM inbox WHERE id = ?1", [id], |r| r.get(0))?;
-        rows.push(JobRow { id, origin });
-    }
-    let payload = JobPayload::Group(GroupJob {
-        rows,
-        trace: trace.cloned(),
-    });
-    insert_job(tx, &main.to_string(), partial, &payload, None)
 }
 
 /// Adds every missing column of [`ADDED_COLUMNS`] and drops every [`DROPPED_TABLES`] table,
@@ -924,16 +717,7 @@ impl Store {
         conn.execute_batch(SCHEMA).map_err(classify)?;
         let mut conn = conn;
         migrate(&mut conn).map_err(classify)?;
-        Ok(Self {
-            conn,
-            wake: None,
-            closed: None,
-        })
-    }
-
-    /// Sets the call made after every commit that inserted a memory job (the observer's wake).
-    pub fn set_memory_wake(&mut self, wake: Arc<dyn Fn() + Send + Sync>) {
-        self.wake = Some(wake);
+        Ok(Self { conn, closed: None })
     }
 
     /// A [`StoreClosed`] that resolves once this store is dropped; a later call replaces it.
@@ -941,241 +725,6 @@ impl Store {
         let (tx, rx) = mpsc::channel();
         self.closed = Some(tx);
         StoreClosed(rx)
-    }
-
-    /// Calls the memory wake when a job was inserted; call only after the commit.
-    fn wake_after(&self, inserted: bool) {
-        if inserted && let Some(wake) = &self.wake {
-            wake();
-        }
-    }
-
-    /// Up to `limit` pending memory jobs, oldest first. A row whose kind or payload does not
-    /// decode is returned by id in `unreadable`, so one bad row never hides the others.
-    pub fn pending_memory_jobs(&self, limit: usize) -> Result<PendingJobs, StoreError> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, kind, partial, payload, attempts, created_at FROM memory_jobs
-             WHERE state = 'pending' ORDER BY id LIMIT ?1",
-        )?;
-        let rows: Vec<(i64, String, bool, Option<String>, i64, i64)> = stmt
-            .query_map([limit as i64], |r| {
-                Ok((
-                    r.get(0)?,
-                    r.get(1)?,
-                    r.get(2)?,
-                    r.get(3)?,
-                    r.get(4)?,
-                    r.get(5)?,
-                ))
-            })?
-            .collect::<Result<_, _>>()?;
-        let mut pending = PendingJobs::default();
-        for (id, kind, partial, payload, attempts, created_at) in rows {
-            let decoded = JobKind::parse(&kind).and_then(|kind| {
-                let payload = JobPayload::parse(kind, payload.as_deref()?).ok()?;
-                Some((kind, payload))
-            });
-            match decoded {
-                Some((kind, payload)) => pending.jobs.push(MemoryJob {
-                    id,
-                    kind,
-                    partial,
-                    payload,
-                    attempts,
-                    created_at,
-                }),
-                None => pending.unreadable.push(id),
-            }
-        }
-        Ok(pending)
-    }
-
-    /// Moves each job out of `pending` (payload cleared) and writes its log row, in one
-    /// transaction. A job that is no longer pending is left as it is and gets no row.
-    pub fn settle_memory_jobs(&mut self, settled: &[Settled], now: i64) -> Result<(), StoreError> {
-        let tx = self
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        for job in settled {
-            let changed = tx.execute(
-                "UPDATE memory_jobs SET state = ?2, payload = NULL, updated_at = ?3
-                 WHERE id = ?1 AND state = 'pending'",
-                params![job.id, job.end.as_str(), now],
-            )?;
-            if changed == 0 {
-                continue;
-            }
-            insert_log(
-                &tx,
-                &LogRow {
-                    at: now,
-                    level: job.level,
-                    code: job.code,
-                    job_id: Some(job.id),
-                    omp_version: Some(job.omp_version.clone()),
-                    jev_model: job.jev_model.clone(),
-                    detail: job.detail.clone(),
-                },
-            )?;
-        }
-        tx.commit()?;
-        Ok(())
-    }
-
-    /// Counts one processing error of pending job `id` (stored as its `last_error`). At
-    /// [`MAX_JOB_ATTEMPTS`] the job becomes `failed`, its payload is cleared and one error log
-    /// row with `code` is written; then returns true.
-    pub fn fail_memory_job_attempt(
-        &mut self,
-        id: i64,
-        code: &'static str,
-        omp_version: &str,
-        now: i64,
-    ) -> Result<bool, StoreError> {
-        let tx = self
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let attempts: Option<i64> = tx
-            .query_row(
-                "UPDATE memory_jobs SET attempts = attempts + 1, last_error = ?2, updated_at = ?3
-                 WHERE id = ?1 AND state = 'pending' RETURNING attempts",
-                params![id, code, now],
-                |r| r.get(0),
-            )
-            .optional()?;
-        let Some(attempts) = attempts else {
-            return Ok(false);
-        };
-        let failed = attempts >= MAX_JOB_ATTEMPTS;
-        if failed {
-            tx.execute(
-                "UPDATE memory_jobs SET state = 'failed', payload = NULL WHERE id = ?1",
-                [id],
-            )?;
-            insert_log(
-                &tx,
-                &LogRow {
-                    at: now,
-                    level: LogLevel::Error,
-                    code,
-                    job_id: Some(id),
-                    omp_version: Some(omp_version.to_owned()),
-                    jev_model: None,
-                    detail: Some(format!("attempts={attempts}")),
-                },
-            )?;
-        }
-        tx.commit()?;
-        Ok(failed)
-    }
-
-    /// Expires every pending `lane`, `subagent` and `scan` job created more than
-    /// `ttl_seconds` before `now` (payload cleared, one [`M_JOB_EXPIRED`] log row each), in
-    /// one transaction. `group` jobs never expire. Returns how many expired.
-    pub fn expire_memory_jobs(
-        &mut self,
-        now: i64,
-        ttl_seconds: i64,
-        omp_version: &str,
-    ) -> Result<usize, StoreError> {
-        let tx = self
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let expired: Vec<(i64, String)> = {
-            let mut stmt = tx.prepare(
-                "UPDATE memory_jobs SET state = 'expired', payload = NULL, updated_at = ?1
-                 WHERE state = 'pending' AND kind IN ('lane','subagent','scan')
-                   AND created_at < ?1 - ?2
-                 RETURNING id, kind",
-            )?;
-            stmt.query_map(params![now, ttl_seconds], |r| Ok((r.get(0)?, r.get(1)?)))?
-                .collect::<Result<_, _>>()?
-        };
-        for (id, kind) in &expired {
-            insert_log(
-                &tx,
-                &LogRow {
-                    at: now,
-                    level: LogLevel::Info,
-                    code: M_JOB_EXPIRED,
-                    job_id: Some(*id),
-                    omp_version: Some(omp_version.to_owned()),
-                    jev_model: None,
-                    detail: Some(format!("kind={kind}")),
-                },
-            )?;
-        }
-        tx.commit()?;
-        Ok(expired.len())
-    }
-
-    /// Whether subagent output `path` still has the `size` and `mtime` (nanoseconds) its cursor
-    /// row holds; the scan then skips the file without reading it.
-    pub fn artifact_unchanged(
-        &self,
-        path: &str,
-        size: i64,
-        mtime: i64,
-    ) -> Result<bool, StoreError> {
-        Ok(self.conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM memory_cursor WHERE path = ?1 AND size = ?2 AND mtime = ?3)",
-            params![path, size, mtime],
-            |r| r.get(0),
-        )?)
-    }
-
-    /// Records subagent output `job.path` with `size`, `mtime` (nanoseconds) and `job.sha256`:
-    /// when its cursor row already holds that size and hash only the mtime is updated (false);
-    /// otherwise the cursor row is written and one `subagent` job is stored, in one
-    /// transaction (true). A file is so queued once per content.
-    pub fn note_artifact(
-        &mut self,
-        job: &SubagentJob,
-        size: i64,
-        mtime: i64,
-        now: i64,
-    ) -> Result<bool, StoreError> {
-        let tx = self
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let unchanged = tx.execute(
-            "UPDATE memory_cursor SET mtime = ?4 WHERE path = ?1 AND size = ?2 AND sha256 = ?3",
-            params![job.path, size, job.sha256, mtime],
-        )? > 0;
-        if unchanged {
-            tx.commit()?;
-            return Ok(false);
-        }
-        tx.execute(
-            "INSERT INTO memory_cursor(path, size, mtime, sha256, seen_at) VALUES (?1, ?2, ?3, ?4, ?5)
-             ON CONFLICT(path) DO UPDATE SET size = ?2, mtime = ?3, sha256 = ?4, seen_at = ?5",
-            params![job.path, size, mtime, job.sha256, now],
-        )?;
-        let inserted = insert_job(
-            &tx,
-            &format!("{} {}", job.sha256, job.path),
-            false,
-            &JobPayload::Subagent(job.clone()),
-            Some(now),
-        )?;
-        tx.commit()?;
-        self.wake_after(inserted);
-        Ok(true)
-    }
-
-    /// Whether a subagent output file under `prefix` (a session folder path ending in `/`) was
-    /// last modified at or after inbox row `row` was received (less one second, for the
-    /// coarse clock file times use): the files a turn's subagents wrote, whichever scan found
-    /// them first.
-    pub fn artifact_written_since(&self, prefix: &str, row: i64) -> Result<bool, StoreError> {
-        Ok(self.conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM memory_cursor
-               WHERE substr(path, 1, length(?1)) = ?1
-                 AND mtime >= (SELECT (CAST(strftime('%s', received_at) AS INTEGER) - 1) * 1000000000
-                               FROM inbox WHERE id = ?2))",
-            params![prefix, row],
-            |r| r.get(0),
-        )?)
     }
 
     /// Writes one `memory_log` row.
@@ -1193,34 +742,6 @@ impl Store {
         )?)
     }
 
-    /// Pending memory jobs: `group` jobs, and every other kind.
-    pub fn memory_backlog(&self) -> Result<Backlog, StoreError> {
-        let (groups, other): (i64, i64) = self.conn.query_row(
-            "SELECT COALESCE(SUM(kind = 'group'), 0), COALESCE(SUM(kind != 'group'), 0)
-             FROM memory_jobs WHERE state = 'pending'",
-            [],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )?;
-        Ok(Backlog {
-            groups: groups as usize,
-            other: other as usize,
-        })
-    }
-
-    /// Whether the lead has been quiet for `seconds` before `now` (unix seconds): no inbox row
-    /// is queued or being processed, and none changed in that time. Self consolidation (#59)
-    /// runs only then, so the lead restart a changed self block brings costs no waiting owner.
-    pub fn lead_quiet(&self, now: i64, seconds: i64) -> Result<bool, StoreError> {
-        let (busy, last): (i64, Option<i64>) = self.conn.query_row(
-            "SELECT COALESCE(SUM(state IN ('queued', 'processing')), 0),
-                    MAX(CAST(strftime('%s', updated_at) AS INTEGER))
-             FROM inbox",
-            [],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )?;
-        Ok(busy == 0 && last.is_none_or(|at| now - at >= seconds))
-    }
-
     /// The next lead generation: 1 for the first lead child this home ever started, one more
     /// for each start after it, kept in the store so a restart never repeats one (moraedang on
     /// #59: the in-memory compaction epoch starts at 0 for every child).
@@ -1234,6 +755,27 @@ impl Store {
         )?)
     }
 
+    /// Whether the flag `name` is set (kept in the counters table as 1; absent or 0 is unset).
+    pub fn flag(&self, name: &str) -> Result<bool, StoreError> {
+        Ok(self
+            .conn
+            .query_row("SELECT value FROM counters WHERE name = ?1", [name], |r| {
+                r.get::<_, i64>(0)
+            })
+            .optional()?
+            .is_some_and(|value| value != 0))
+    }
+
+    /// Sets or clears the flag `name` ([`Self::flag`]).
+    pub fn set_flag(&self, name: &str, on: bool) -> Result<(), StoreError> {
+        self.conn.execute(
+            "INSERT INTO counters(name, value) VALUES (?1, ?2)
+             ON CONFLICT(name) DO UPDATE SET value = excluded.value",
+            params![name, i64::from(on)],
+        )?;
+        Ok(())
+    }
+
     /// Writes `rows` to the recall ledger in one transaction.
     pub fn record_recall(&mut self, rows: &[RecallRow]) -> Result<(), StoreError> {
         let tx = self
@@ -1242,8 +784,8 @@ impl Store {
         for row in rows {
             tx.execute(
                 "INSERT INTO recall_ledger(conversation, entry_id, entry_hash, state,
-                     lead_generation, lead_epoch, row_id, at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                     lead_generation, lead_epoch, row_id, at, phase)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
                 params![
                     row.conversation,
                     row.entry_id,
@@ -1252,7 +794,8 @@ impl Store {
                     row.lead_generation,
                     row.lead_epoch,
                     row.row_id,
-                    row.at
+                    row.at,
+                    row.phase.as_str()
                 ],
             )?;
         }
@@ -1273,7 +816,7 @@ impl Store {
     ) -> Result<Vec<RecallRow>, StoreError> {
         let mut stmt = self.conn.prepare(
             "SELECT conversation, entry_id, entry_hash, state, lead_generation, lead_epoch,
-                    row_id, at
+                    row_id, at, phase
              FROM recall_ledger
              WHERE (state IN ('delivered', 'shadow') AND lead_generation = ?2
                     AND lead_epoch = ?3)
@@ -1293,14 +836,61 @@ impl Store {
                 lead_epoch: r.get(5)?,
                 row_id: r.get(6)?,
                 at: r.get(7)?,
+                phase: RecallPhase::parse(&r.get::<_, String>(8)?),
             })
         })?;
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
-    /// Deletes memory log rows, recall ledger rows and settled memory jobs older than 30 days
-    /// before `now`.
-    /// Pending jobs and cursor rows are kept.
+    /// The newest `limit` recall ledger rows, newest first, for the owner's "recent recalls"
+    /// command.
+    pub fn recent_recalls(&self, limit: usize) -> Result<Vec<RecallRow>, StoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT conversation, entry_id, entry_hash, state, lead_generation, lead_epoch,
+                    row_id, at, phase
+             FROM recall_ledger
+             ORDER BY id DESC
+             LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(params![i64::try_from(limit).unwrap_or(i64::MAX)], |r| {
+            let state: String = r.get(3)?;
+            Ok(RecallRow {
+                conversation: r.get(0)?,
+                entry_id: r.get(1)?,
+                entry_hash: r.get(2)?,
+                state: RecallState::parse(&state).ok_or_else(|| {
+                    rusqlite::Error::InvalidColumnType(3, state, rusqlite::types::Type::Text)
+                })?,
+                lead_generation: r.get(4)?,
+                lead_epoch: r.get(5)?,
+                row_id: r.get(6)?,
+                at: r.get(7)?,
+                phase: RecallPhase::parse(&r.get::<_, String>(8)?),
+            })
+        })?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// Recall advisor calls answered at or after `since` (unix seconds): their
+    /// [`I_RECALL_PICK`](crate::recall::I_RECALL_PICK) log rows.
+    pub fn recall_calls_since(&self, since: i64) -> Result<i64, StoreError> {
+        Ok(self.conn.query_row(
+            "SELECT COUNT(*) FROM memory_log WHERE code = ?1 AND at >= ?2",
+            params![crate::recall::I_RECALL_PICK, since],
+            |r| r.get(0),
+        )?)
+    }
+
+    /// When the newest `delivered` recall ledger row was written (unix seconds).
+    pub fn last_delivered_recall(&self) -> Result<Option<i64>, StoreError> {
+        Ok(self.conn.query_row(
+            "SELECT MAX(at) FROM recall_ledger WHERE state = 'delivered'",
+            [],
+            |r| r.get(0),
+        )?)
+    }
+
+    /// Deletes memory log rows and recall ledger rows older than 30 days before `now`.
     pub fn prune_memory(&mut self, now: i64) -> Result<(), StoreError> {
         let cutoff = now - MEMORY_KEEP_SECONDS;
         let tx = self
@@ -1308,10 +898,6 @@ impl Store {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         tx.execute("DELETE FROM memory_log WHERE at < ?1", [cutoff])?;
         tx.execute("DELETE FROM recall_ledger WHERE at < ?1", [cutoff])?;
-        tx.execute(
-            "DELETE FROM memory_jobs WHERE state != 'pending' AND updated_at < ?1",
-            [cutoff],
-        )?;
         tx.commit()?;
         Ok(())
     }
@@ -1555,12 +1141,12 @@ impl Store {
 
     /// Marks every row of an interrupted group `needs_check` with `code` and, in the same
     /// transaction, holds the queued owner rows of their conversations, so the hold survives
-    /// a restart. The group's `partial` memory job is stored in the same transaction.
+    /// a restart. `_trace` is the group's [`TurnTrace`]; nothing stores it now.
     pub fn interrupt_group(
         &mut self,
         ids: &[i64],
         code: &str,
-        trace: &TurnTrace,
+        _trace: &TurnTrace,
     ) -> Result<(), StoreError> {
         let tx = self
             .conn
@@ -1580,9 +1166,7 @@ impl Store {
                 [id],
             )?;
         }
-        let inserted = enqueue_group(&tx, ids, true, Some(trace))?;
         tx.commit()?;
-        self.wake_after(inserted);
         Ok(())
     }
 
@@ -1615,15 +1199,15 @@ impl Store {
     }
 
     /// Stores a turn group's reply on its main row (`reply_pending`, as
-    /// [`Store::save_reply`]) and marks the steered row, if any, `done`, in one transaction
-    /// that also stores the group's memory job.
+    /// [`Store::save_reply`]) and marks the steered row, if any, `done`, in one transaction.
+    /// `_trace` is the group's [`TurnTrace`]; nothing stores it now.
     pub fn finish_group(
         &mut self,
         main_id: i64,
         reply: &str,
         out_files: Option<&str>,
         steered: Option<i64>,
-        trace: &TurnTrace,
+        _trace: &TurnTrace,
     ) -> Result<(), StoreError> {
         let tx = self
             .conn
@@ -1648,10 +1232,7 @@ impl Store {
                 return Err(StoreError::Invalid("no such inbox row"));
             }
         }
-        let ids: Vec<i64> = std::iter::once(main_id).chain(steered).collect();
-        let inserted = enqueue_group(&tx, &ids, false, Some(trace))?;
         tx.commit()?;
-        self.wake_after(inserted);
         Ok(())
     }
 
@@ -1675,13 +1256,13 @@ impl Store {
         Ok(())
     }
 
-    /// Marks every row of a turn group `failed` with `code`, in one transaction that also
-    /// stores the group's `partial` memory job.
+    /// Marks every row of a turn group `failed` with `code`, in one transaction. `_trace` is
+    /// the group's [`TurnTrace`]; nothing stores it now.
     pub fn fail_group(
         &mut self,
         ids: &[i64],
         code: &str,
-        trace: &TurnTrace,
+        _trace: &TurnTrace,
     ) -> Result<(), StoreError> {
         let tx = self
             .conn
@@ -1697,9 +1278,7 @@ impl Store {
                 return Err(StoreError::Invalid("no such inbox row"));
             }
         }
-        let inserted = enqueue_group(&tx, ids, true, Some(trace))?;
         tx.commit()?;
-        self.wake_after(inserted);
         Ok(())
     }
 
@@ -1722,32 +1301,17 @@ impl Store {
     /// re-queued) and the queued rows of its conversation are held; then queued rows still
     /// waiting for their files fail with [`E_FILE_INCOMPLETE`]; outbound files whose upload
     /// was cut are skipped (row ids in `interrupted_uploads`); `reply_pending` rows are
-    /// returned for re-sending. Each cut group (rows grouped by the turn they ran in) gets
-    /// its `partial` memory job without a trace, so the owner's words are still observed.
+    /// returned for re-sending.
     pub fn recover_on_start(&mut self) -> Result<Recovered, StoreError> {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let cut: Vec<(i64, Option<i64>)> = {
-            let mut stmt = tx.prepare(
-                "SELECT id, steered_into FROM inbox WHERE state = 'processing' ORDER BY id",
-            )?;
-            stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+        let ids: Vec<i64> = {
+            let mut stmt =
+                tx.prepare("SELECT id FROM inbox WHERE state = 'processing' ORDER BY id")?;
+            stmt.query_map([], |r| r.get(0))?
                 .collect::<Result<_, _>>()?
         };
-        let ids: Vec<i64> = cut.iter().map(|(id, _)| *id).collect();
-        // Ordered by id, so each group lists its main row (the older one) first.
-        let mut groups: BTreeMap<i64, Vec<i64>> = BTreeMap::new();
-        for (id, steered_into) in cut {
-            groups
-                .entry(steered_into.unwrap_or(id))
-                .or_default()
-                .push(id);
-        }
-        let mut inserted = false;
-        for group in groups.values() {
-            inserted |= enqueue_group(&tx, group, true, None)?;
-        }
         tx.execute(
             &hold_queued_sql("SELECT conversation_key FROM inbox WHERE state = 'processing'"),
             [],
@@ -1812,7 +1376,6 @@ impl Store {
             stmt.query_map([], map_row)?.collect::<Result<_, _>>()?
         };
         tx.commit()?;
-        self.wake_after(inserted);
         Ok(Recovered {
             needs_check,
             reply_pending,
@@ -1960,20 +1523,17 @@ impl Store {
     }
 
     /// Marks a lane that is not running as closed, in one transaction; a second call keeps the
-    /// first time and reason. The first close also stores the `scan` memory job of the lane's
-    /// session folder.
+    /// first time and reason.
     pub fn close_lane(&mut self, id: i64, reason: &str) -> Result<LaneClose, StoreError> {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let row: Option<(String, Option<String>, bool)> = tx
-            .query_row(
-                "SELECT state, repo, closed_at IS NOT NULL FROM lanes WHERE id = ?1",
-                [id],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-            )
+        let row: Option<(String, Option<String>)> = tx
+            .query_row("SELECT state, repo FROM lanes WHERE id = ?1", [id], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
             .optional()?;
-        let Some((state, repo, closed_before)) = row else {
+        let Some((state, repo)) = row else {
             return Ok(LaneClose::Unknown);
         };
         if state == "running" {
@@ -1986,16 +1546,7 @@ impl Store {
             ),
             params![id, reason],
         )?;
-        let inserted = !closed_before
-            && insert_job(
-                &tx,
-                &format!("lane:{id}"),
-                false,
-                &JobPayload::Scan(ScanJob { lane: id }),
-                None,
-            )?;
         tx.commit()?;
-        self.wake_after(inserted);
         Ok(LaneClose::Closed { repo })
     }
 
@@ -2030,9 +1581,8 @@ impl Store {
     }
 
     /// Stores lane prompt `seq`'s result as a queued inbox row of the lane's conversation
-    /// and sets the lane's state, in one transaction. A result without `error` also stores
-    /// its `lane` memory job there; a failed, stopped or unmet one gets none. A second call
-    /// for the same `seq` changes nothing and returns false.
+    /// and sets the lane's state, in one transaction. A second call for the same `seq` changes
+    /// nothing and returns false.
     pub fn finish_lane(
         &mut self,
         id: i64,
@@ -2063,21 +1613,11 @@ impl Store {
         if inserted == 0 {
             return Ok(false);
         }
-        let row = tx.last_insert_rowid();
         tx.execute(
             &format!("UPDATE lanes SET state = ?2, error = ?3, updated_at = {NOW} WHERE id = ?1"),
             params![id, state.as_str(), error],
         )?;
-        let queued = error.is_none()
-            && insert_job(
-                &tx,
-                &format!("{id}:{seq}"),
-                false,
-                &JobPayload::Lane(LaneJob { row, lane: id, seq }),
-                None,
-            )?;
         tx.commit()?;
-        self.wake_after(queued);
         Ok(true)
     }
 
@@ -3820,441 +3360,49 @@ mod tests {
         );
     }
 
-    fn pending_jobs(s: &Store, kind: JobKind) -> Vec<MemoryJob> {
-        s.pending_memory_jobs(100)
-            .unwrap()
-            .jobs
-            .into_iter()
-            .filter(|job| job.kind == kind)
-            .collect()
-    }
-
-    fn job_row(id: i64, origin: &str) -> JobRow {
-        JobRow {
-            id,
-            origin: origin.into(),
-        }
-    }
-
-    fn sample_trace() -> TurnTrace {
-        TurnTrace {
-            tools: vec![
-                ToolUse::new("web_search", ToolSource::Web),
-                ToolUse::new("task", ToolSource::Task),
-            ],
-            task: true,
-            settled: true,
-        }
-    }
-
-    /// Counts the memory wakes of `s`.
-    fn count_wakes(s: &mut Store) -> Arc<std::sync::atomic::AtomicUsize> {
-        let wakes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let counter = Arc::clone(&wakes);
-        s.set_memory_wake(Arc::new(move || {
-            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        }));
-        wakes
-    }
-
-    fn wakes(n: &std::sync::atomic::AtomicUsize) -> usize {
-        n.load(std::sync::atomic::Ordering::SeqCst)
-    }
-
-    /// A lane of `key` with its result `seq` stored (idle); returns the result's row id.
-    fn lane_result(s: &mut Store, key: &str, seq: i64, text: &str) -> i64 {
-        if s.lane(1).unwrap().is_none() {
-            s.start_lane("call-1", key, "t", None, None, 3).unwrap();
-        }
-        assert!(s.finish_lane(1, seq, text, LaneState::Idle, None).unwrap());
-        s.count().unwrap()
-    }
-
     #[test]
-    fn memory_tables_are_added_to_an_old_database() {
+    fn an_old_database_with_memory_job_tables_still_opens() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("inbox.sqlite");
         let conn = Connection::open(&path).unwrap();
         conn.execute_batch(SLICE4_SCHEMA).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE memory_jobs(id INTEGER PRIMARY KEY, kind TEXT, key TEXT, payload TEXT);
+             INSERT INTO memory_jobs(kind, key, payload) VALUES ('group', '1', '{}');
+             CREATE TABLE memory_cursor(path TEXT PRIMARY KEY, size INTEGER);",
+        )
+        .unwrap();
         drop(conn);
         let mut s = Store::open(&path).unwrap();
         let names = tables(&s.conn);
-        for table in ["memory_jobs", "memory_log", "memory_cursor"] {
-            assert!(names.contains(&table.to_string()), "{table}: {names:?}");
+        assert!(names.contains(&"memory_log".to_string()), "{names:?}");
+        for table in ["memory_jobs", "memory_cursor"] {
+            assert!(!names.contains(&table.to_string()), "{table}: {names:?}");
         }
-        // The old rows take part: a turn of an old row leaves its job.
         let id = new_id(admit(&mut s, "m1", "k1"));
         assert!(s.claim(id).unwrap());
         s.finish_group(id, "r", None, None, &TurnTrace::default())
             .unwrap();
-        assert_eq!(pending_jobs(&s, JobKind::Group).len(), 1);
+        assert_eq!(s.get(id).unwrap().unwrap().state, State::ReplyPending);
     }
 
     #[test]
-    fn memory_job_group_is_stored_with_the_reply() {
+    fn memory_log_rows_are_pruned_after_thirty_days() {
         let (_d, _p, mut s) = open_tmp();
-        let wake = count_wakes(&mut s);
-        let main = lane_result(&mut s, "k1", 1, "lane said");
-        assert_eq!(wakes(&wake), 1, "the lane result's own job");
-        let owner = new_id(admit(&mut s, "m1", "k1"));
-        assert!(s.claim(main).unwrap());
-        assert!(s.steer_into(owner, main).unwrap());
-        s.finish_group(main, "both", None, Some(owner), &sample_trace())
-            .unwrap();
-        assert_eq!(wakes(&wake), 2);
-        let jobs = pending_jobs(&s, JobKind::Group);
-        assert_eq!(jobs.len(), 1);
-        assert!(!jobs[0].partial);
-        assert_eq!(
-            jobs[0].payload,
-            JobPayload::Group(GroupJob {
-                rows: vec![job_row(main, "lane"), job_row(owner, "owner")],
-                trace: Some(sample_trace()),
-            })
-        );
-        let key: String = s
-            .conn
-            .query_row(
-                "SELECT key FROM memory_jobs WHERE id = ?1",
-                [jobs[0].id],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(key, main.to_string());
-    }
-
-    #[test]
-    fn memory_job_group_is_partial_on_fail_and_interrupt() {
-        let (_d, _p, mut s) = open_tmp();
-        let a = new_id(admit(&mut s, "m1", "k1"));
-        let b = new_id(admit(&mut s, "m2", "k2"));
-        assert!(s.claim(a).unwrap());
-        assert!(s.claim(b).unwrap());
-        s.fail_group(&[a], "E_TEST", &sample_trace()).unwrap();
-        s.interrupt_group(&[b], "E_CHILD_LOST", &TurnTrace::default())
-            .unwrap();
-        let jobs = pending_jobs(&s, JobKind::Group);
-        assert_eq!(jobs.len(), 2);
-        assert!(jobs.iter().all(|job| job.partial));
-        assert_eq!(
-            jobs.iter()
-                .map(|job| job.payload.clone())
-                .collect::<Vec<_>>(),
-            [
-                JobPayload::Group(GroupJob {
-                    rows: vec![job_row(a, "owner")],
-                    trace: Some(sample_trace()),
-                }),
-                JobPayload::Group(GroupJob {
-                    rows: vec![job_row(b, "owner")],
-                    trace: Some(TurnTrace::default()),
-                }),
-            ]
-        );
-    }
-
-    #[test]
-    fn memory_job_rolls_back_with_its_transaction() {
-        let (_d, _p, mut s) = open_tmp();
-        let wake = count_wakes(&mut s);
-        let m = new_id(admit(&mut s, "m1", "k1"));
-        assert!(s.claim(m).unwrap());
-        assert!(
-            s.finish_group(m, "r", None, Some(9999), &sample_trace())
-                .is_err()
-        );
-        let row = s.get(m).unwrap().unwrap();
-        assert_eq!(row.state, State::Processing);
-        assert_eq!(row.reply, None);
-        assert!(s.pending_memory_jobs(100).unwrap().jobs.is_empty());
-        assert!(s.fail_group(&[m, 9999], "E_TEST", &sample_trace()).is_err());
-        assert_eq!(s.get(m).unwrap().unwrap().state, State::Processing);
-        assert!(s.pending_memory_jobs(100).unwrap().jobs.is_empty());
-        assert_eq!(wakes(&wake), 0);
-    }
-
-    #[test]
-    fn memory_job_lane_is_stored_once_per_result() {
-        let (_d, _p, mut s) = open_tmp();
-        let row = lane_result(&mut s, "k1", 1, "done");
-        assert!(!s.finish_lane(1, 1, "again", LaneState::Idle, None).unwrap());
-        assert!(
-            s.finish_lane(1, 2, "broke", LaneState::Failed, Some("E_TEST"))
-                .unwrap()
-        );
-        let jobs = pending_jobs(&s, JobKind::Lane);
-        assert_eq!(jobs.len(), 1);
-        assert_eq!(
-            jobs[0].payload,
-            JobPayload::Lane(LaneJob {
-                row,
-                lane: 1,
-                seq: 1
-            })
-        );
-        assert_eq!(s.get(row).unwrap().unwrap().message_id, "1:1");
-    }
-
-    #[test]
-    fn memory_job_recovery_groups_the_interrupted_rows() {
-        let (_d, path, mut s) = open_tmp();
-        let a = new_id(admit(&mut s, "m1", "k1"));
-        let b = new_id(admit(&mut s, "m2", "k1"));
-        let c = new_id(admit(&mut s, "m3", "k2"));
-        assert!(s.claim(a).unwrap());
-        assert!(s.steer_into(b, a).unwrap());
-        assert!(s.claim(c).unwrap());
-        drop(s);
-        let mut s = Store::open(&path).unwrap();
-        s.recover_on_start().unwrap();
-        let jobs = pending_jobs(&s, JobKind::Group);
-        assert_eq!(
-            jobs.iter()
-                .map(|job| (job.partial, job.payload.clone()))
-                .collect::<Vec<_>>(),
-            [
-                (
-                    true,
-                    JobPayload::Group(GroupJob {
-                        rows: vec![job_row(a, "owner"), job_row(b, "owner")],
-                        trace: None,
-                    })
-                ),
-                (
-                    true,
-                    JobPayload::Group(GroupJob {
-                        rows: vec![job_row(c, "owner")],
-                        trace: None,
-                    })
-                ),
-            ]
-        );
-        // A second start finds nothing processing and adds nothing.
-        s.recover_on_start().unwrap();
-        assert_eq!(s.pending_memory_jobs(100).unwrap().jobs.len(), 2);
-    }
-
-    #[test]
-    fn memory_job_scan_is_stored_on_the_first_lane_close() {
-        let (_d, _p, mut s) = open_tmp();
-        let wake = count_wakes(&mut s);
-        lane_result(&mut s, "k1", 1, "done");
-        assert!(matches!(
-            s.close_lane(1, "qa").unwrap(),
-            LaneClose::Closed { .. }
-        ));
-        assert!(matches!(
-            s.close_lane(1, "again").unwrap(),
-            LaneClose::Closed { .. }
-        ));
-        let jobs = pending_jobs(&s, JobKind::Scan);
-        assert_eq!(jobs.len(), 1);
-        assert_eq!(jobs[0].payload, JobPayload::Scan(ScanJob { lane: 1 }));
-        assert_eq!(wakes(&wake), 2, "the lane result and the first close");
-        assert!(matches!(s.close_lane(7, "qa").unwrap(), LaneClose::Unknown));
-        assert_eq!(pending_jobs(&s, JobKind::Scan).len(), 1);
-    }
-
-    #[test]
-    fn an_unreadable_memory_job_is_returned_apart() {
-        let (_d, _p, mut s) = open_tmp();
-        let job = |n: &str| SubagentJob {
-            path: format!("/s/{n}.md"),
-            session: "lead".into(),
-            task: n.into(),
-            sha256: n.into(),
-        };
-        for n in ["a", "b", "c"] {
-            assert!(s.note_artifact(&job(n), 1, 1, 100).unwrap());
-        }
-        s.conn
-            .execute(
-                "UPDATE memory_jobs SET payload = 'not json' WHERE id = 1",
-                [],
-            )
-            .unwrap();
-        s.conn
-            .execute("UPDATE memory_jobs SET kind = 'scan' WHERE id = 2", [])
-            .unwrap();
-        let pending = s.pending_memory_jobs(100).unwrap();
-        assert_eq!(pending.unreadable, [1, 2]);
-        assert_eq!(pending.jobs.iter().map(|j| j.id).collect::<Vec<_>>(), [3]);
-    }
-
-    #[test]
-    fn memory_cursor_queues_a_new_or_changed_file_once() {
-        let (_d, _p, mut s) = open_tmp();
-        let job = |sha: &str| SubagentJob {
-            path: "/s/lead/x/Explore_2.md".into(),
-            session: "lead".into(),
-            task: "Explore_2".into(),
-            sha256: sha.into(),
-        };
-        let path = "/s/lead/x/Explore_2.md";
-        assert!(!s.artifact_unchanged(path, 10, 7).unwrap());
-        assert!(s.note_artifact(&job("aa"), 10, 7, 100).unwrap());
-        assert!(s.artifact_unchanged(path, 10, 7).unwrap());
-        // Touched, same content: no job, but the new mtime is kept so the next scan skips it.
-        assert!(!s.note_artifact(&job("aa"), 10, 8, 200).unwrap());
-        assert!(s.artifact_unchanged(path, 10, 8).unwrap());
-        assert_eq!(pending_jobs(&s, JobKind::Subagent).len(), 1);
-        assert!(s.note_artifact(&job("bb"), 12, 9, 300).unwrap());
-        let jobs = pending_jobs(&s, JobKind::Subagent);
-        assert_eq!(
-            jobs.iter()
-                .map(|j| (j.created_at, j.payload.clone()))
-                .collect::<Vec<_>>(),
-            [
-                (100, JobPayload::Subagent(job("aa"))),
-                (300, JobPayload::Subagent(job("bb")))
-            ]
-        );
-        let cursor: (i64, String, i64) = s
-            .conn
-            .query_row("SELECT size, sha256, seen_at FROM memory_cursor", [], |r| {
-                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+        for (at, detail) in [(1000, "old"), (5000, "18.23.0")] {
+            s.memory_log(&LogRow {
+                at,
+                level: LogLevel::Warn,
+                code: "W_OMP_VERSION",
+                job_id: None,
+                omp_version: None,
+                detail: Some(detail.into()),
             })
             .unwrap();
-        assert_eq!(cursor, (12, "bb".into(), 300));
-    }
-
-    #[test]
-    fn memory_job_payload_holds_no_message_text() {
-        const SENTINEL: &str = "SENTINEL_7c1e";
-        let (_d, path, mut s) = open_tmp();
-        let text = format!("remember {SENTINEL}");
-        let lane = lane_result(&mut s, "k1", 1, &text);
-        let a = new_id(s.admit("test", "m1", "k1", "c", "111", &text).unwrap());
-        assert!(s.claim(lane).unwrap());
-        assert!(s.steer_into(a, lane).unwrap());
-        s.finish_group(lane, &text, None, Some(a), &sample_trace())
-            .unwrap();
-        let b = new_id(s.admit("test", "m2", "k2", "c", "111", &text).unwrap());
-        assert!(s.claim(b).unwrap());
-        drop(s);
-        let mut s = Store::open(&path).unwrap();
-        s.recover_on_start().unwrap();
-        s.close_lane(1, "qa").unwrap();
-        let payloads: Vec<String> = {
-            let mut stmt = s.conn.prepare("SELECT payload FROM memory_jobs").unwrap();
-            stmt.query_map([], |r| r.get(0))
-                .unwrap()
-                .collect::<Result<_, _>>()
-                .unwrap()
-        };
-        assert_eq!(payloads.len(), 4, "lane, group, recovered group, scan");
-        for payload in payloads {
-            assert!(!payload.contains(SENTINEL), "{payload}");
         }
-    }
-
-    #[test]
-    fn memory_job_settle_fail_expire_and_prune() {
-        let (_d, _p, mut s) = open_tmp();
-        let job = |n: &str| SubagentJob {
-            path: format!("/s/{n}.md"),
-            session: "lead".into(),
-            task: n.into(),
-            sha256: n.into(),
-        };
-        for (n, at) in [("a", 100), ("b", 100), ("c", 100), ("d", 900)] {
-            assert!(s.note_artifact(&job(n), 1, 1, at).unwrap());
-        }
-        let m = new_id(admit(&mut s, "m1", "k1"));
-        assert!(s.claim(m).unwrap());
-        s.fail_group(&[m], "E_TEST", &TurnTrace::default()).unwrap();
-        let ids: Vec<i64> = s
-            .pending_memory_jobs(100)
-            .unwrap()
-            .jobs
-            .iter()
-            .map(|j| j.id)
-            .collect();
-        assert_eq!(ids.len(), 5);
-        assert_eq!(
-            s.memory_backlog().unwrap(),
-            Backlog {
-                groups: 1,
-                other: 4
-            }
-        );
-
-        s.settle_memory_jobs(
-            &[Settled {
-                id: ids[0],
-                end: JobEnd::Done,
-                level: LogLevel::Info,
-                code: "M_JOB_DONE",
-                omp_version: "18.22.2".into(),
-                jev_model: Some("jev-1".into()),
-                detail: Some("kind=subagent saved=0".into()),
-            }],
-            1000,
-        )
-        .unwrap();
-        assert!(
-            s.memory_logged("M_JOB_DONE", "kind=subagent saved=0")
-                .unwrap()
-        );
-        let (state, payload): (String, Option<String>) = s
-            .conn
-            .query_row(
-                "SELECT state, payload FROM memory_jobs WHERE id = ?1",
-                [ids[0]],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .unwrap();
-        assert_eq!((state.as_str(), payload), ("done", None));
-
-        assert!(
-            !s.fail_memory_job_attempt(ids[1], "E_TEST", "v", 1000)
-                .unwrap()
-        );
-        assert!(
-            !s.fail_memory_job_attempt(ids[1], "E_TEST", "v", 1000)
-                .unwrap()
-        );
-        assert!(
-            s.fail_memory_job_attempt(ids[1], "E_TEST", "v", 1000)
-                .unwrap()
-        );
-        assert!(
-            !s.fail_memory_job_attempt(ids[1], "E_TEST", "v", 1000)
-                .unwrap()
-        );
-        assert!(s.memory_logged("E_TEST", "attempts=3").unwrap());
-
-        // c (created at 100) expires, d (900) and the group job do not.
-        assert_eq!(s.expire_memory_jobs(1000, 500, "v").unwrap(), 1);
-        assert_eq!(
-            s.memory_backlog().unwrap(),
-            Backlog {
-                groups: 1,
-                other: 1
-            }
-        );
-        assert!(s.memory_logged(M_JOB_EXPIRED, "kind=subagent").unwrap());
-
-        s.memory_log(&LogRow {
-            at: 5000,
-            level: LogLevel::Warn,
-            code: "W_OMP_VERSION",
-            job_id: None,
-            omp_version: None,
-            jev_model: None,
-            detail: Some("18.23.0".into()),
-        })
-        .unwrap();
         s.prune_memory(1000 + MEMORY_KEEP_SECONDS + 1).unwrap();
-        let count = |sql: &str| -> i64 { s.conn.query_row(sql, [], |r| r.get(0)).unwrap() };
-        assert_eq!(
-            count("SELECT COUNT(*) FROM memory_jobs"),
-            2,
-            "pending jobs stay"
-        );
-        assert_eq!(count("SELECT COUNT(*) FROM memory_log"), 1);
+        assert!(!s.memory_logged("W_OMP_VERSION", "old").unwrap());
         assert!(s.memory_logged("W_OMP_VERSION", "18.23.0").unwrap());
-        assert_eq!(count("SELECT COUNT(*) FROM memory_cursor"), 4);
     }
 
     #[test]
@@ -4345,6 +3493,7 @@ mod tests {
             lead_epoch: epoch,
             row_id: Some(1),
             at,
+            phase: RecallPhase::Owner,
         };
         store
             .record_recall(&[

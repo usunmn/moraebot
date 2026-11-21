@@ -16,7 +16,10 @@
 //! cannot be read).
 //!
 //! `get_state` answers a full session state whose `dumpTools` lists one tool
-//! per comma-separated name in FAKE_OMP_DUMP_TOOLS (unset or empty: none).
+//! per comma-separated name in FAKE_OMP_DUMP_TOOLS (unset or empty: none), plus
+//! `report_issue` like omp's Auto-QA (`dev.autoqa`, on by default, even with `--no-tools`)
+//! unless the overlay file named by `--config <path>` has a top-level `dev:` block with an
+//! indented `autoqa: false` line.
 //!
 //! Envelope: a prompt whose first line starts with `[moraebot ` and ends with
 //! `]` is echoed without that line (and its newline); any other message is
@@ -59,6 +62,10 @@
 //!
 //! Reply gate: with FAKE_OMP_REPLY_GATE=<path> set, a prompt answered like `ok` writes its
 //! reply only once `<path>` exists (`agent_start` comes at once).
+//!
+//! Usage: with FAKE_OMP_USAGE set (a JSON object such as
+//! `{"input":10,"output":5,"cacheRead":900,"cacheWrite":0}`), every assistant message a run ends
+//! with carries it as its `usage`, in `message_end` and `agent_end` alike.
 //!
 //! Refused prompt: a prompt whose message contains FAKE_OMP_REJECT_TRIGGER (unset
 //! or empty: none) gets an error `response` (code `E_PROMPT_REFUSED`) in every
@@ -113,6 +120,8 @@ use serde_json::{Value, json};
 const SESSION_ID: &str = "fake-session-1";
 /// This fake is a moraebot memory summarizer child.
 static SUMMARIZER: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+/// Whether `get_state` lists omp's Auto-QA tool (`report_issue`); see [`autoqa`].
+static AUTOQA: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 const DEFAULT_TOOL_TRIGGER: &str = "run-tools";
 const DEFAULT_LANE_TOOL_TRIGGER: &str = "run-lane-tools";
 
@@ -166,6 +175,7 @@ fn main() {
     SUMMARIZER
         .set(arg_value(&argv, "--session-dir").is_some_and(|dir| dir.contains("/summarizer/")))
         .expect("set once");
+    AUTOQA.set(autoqa(&argv)).expect("set once");
     let mode = select_mode(lane);
     let log = std::env::var_os("FAKE_OMP_LOG").map(std::path::PathBuf::from);
     if let Some(path) = &log {
@@ -260,14 +270,35 @@ fn is_lane(argv: &[String]) -> bool {
     arg_value(argv, "--session-dir").is_some_and(|dir| dir.contains("/lanes/"))
 }
 
-/// A full `get_state` answer; `dumpTools` from FAKE_OMP_DUMP_TOOLS.
-fn session_state() -> Value {
-    let tools: Vec<Value> = std::env::var("FAKE_OMP_DUMP_TOOLS")
+/// Whether omp's Auto-QA tool is on: not when the `--config` overlay sets `dev: autoqa: false`.
+fn autoqa(argv: &[String]) -> bool {
+    let Some(overlay) = arg_value(argv, "--config").and_then(|p| std::fs::read_to_string(p).ok())
+    else {
+        return true;
+    };
+    let mut in_dev = false;
+    for line in overlay.lines() {
+        if !line.starts_with(' ') {
+            in_dev = line.trim_end() == "dev:";
+        } else if in_dev && line.trim() == "autoqa: false" {
+            return false;
+        }
+    }
+    true
+}
+
+/// A full `get_state` answer; `dumpTools` from FAKE_OMP_DUMP_TOOLS, plus `report_issue` when
+/// Auto-QA is on.
+fn session_state(autoqa: bool) -> Value {
+    let mut tools: Vec<Value> = std::env::var("FAKE_OMP_DUMP_TOOLS")
         .unwrap_or_default()
         .split(',')
         .filter(|name| !name.is_empty())
         .map(|name| json!({"name": name, "description": "fake tool"}))
         .collect();
+    if autoqa {
+        tools.push(json!({"name": "report_issue", "description": "fake Auto-QA tool"}));
+    }
     json!({
         "sessionId": SESSION_ID,
         "isStreaming": false,
@@ -333,7 +364,7 @@ impl Fake {
                     }),
                 )
             }
-            "get_state" => respond_ok(out, &id, command, session_state()),
+            "get_state" => respond_ok(out, &id, command, session_state(*AUTOQA.get().unwrap())),
             "get_session_lease" => {
                 let requested = frame
                     .get("sessionIds")
@@ -788,14 +819,20 @@ fn finish_echo(id: &Value, message: &str, out: &mut impl Write) {
 }
 
 /// Writes `message_end` and `agent_end` for one assistant `text`; `extra`
-/// fields are added to the `agent_end` frame.
+/// fields are added to the `agent_end` frame. The message carries FAKE_OMP_USAGE as its usage.
 fn end_run(text: &str, extra: Value, out: &mut impl Write) {
-    let assistant = json!({
+    let mut assistant = json!({
         "role": "assistant",
         "content": [{"type": "text", "text": text}],
         "stopReason": "stop",
         "timestamp": 0,
     });
+    if let Some(usage) = std::env::var("FAKE_OMP_USAGE")
+        .ok()
+        .and_then(|usage| serde_json::from_str::<Value>(&usage).ok())
+    {
+        assistant["usage"] = usage;
+    }
     send(out, &json!({"type": "message_end", "message": assistant}));
     let mut end = json!({"type": "agent_end", "messages": [assistant]});
     if let (Some(end), Value::Object(extra)) = (end.as_object_mut(), extra) {

@@ -36,7 +36,7 @@
 //!
 //! Owner new-session command ([`crate::new_session`]): an owner row without attachments whose
 //! whole text is `새 세션`, `새 세션 시작`, `새 세션으로 시작`, `new session` or `/new` is checked first in
-//! that slot, before the memory commands, so it never costs a jev call. With attachments it gets
+//! that slot, before the memory commands. With attachments it gets
 //! one fixed notice ([`N_NEW_SESSION_FILES`]) and nothing is stored, the same shape as the
 //! `/` notice. On arrival it is only queued, never steered
 //! and never claimed: it waits in the FIFO, so a running turn ends first, and the store refuses
@@ -58,6 +58,11 @@
 //! else drops the question and is handled as usual). The question lives in memory only. A
 //! command row queued without that check (a race with the worker, a restart) is answered
 //! by the worker the same way; lane-result rows are never checked.
+//!
+//! Owner corrections ([`crate::lessons`]): when the worker turns an owner row into a lead
+//! input and `[memory.self]` is on, a row whose text matches a correction pattern is queued
+//! as an owner entry in `self/observations.md` (the turn never waits for it); at every third
+//! similar correction the input gets a short block asking the lead to offer a standing rule.
 //!
 //! Owner status questions ([`crate::status`]), unless `lead.direct_status = false`: in the same
 //! slot, right after the memory check,
@@ -128,15 +133,15 @@ use crate::adapter::{
     MessengerAdapter, split_reply,
 };
 use crate::chat::{self, ChatFile, ChatManager};
-use crate::config::Config;
+use crate::config::{Config, SelfConfig};
 use crate::files::{self, OutFile, SavedFile};
 use crate::gateway::{E_GATEWAY_TASK, GatewayError};
 use crate::lane::{LaneManager, LaneNews};
 use crate::lead;
+use crate::lessons;
 use crate::memory::MemoryHandle;
 use crate::memory_commands::{self, Command};
 use crate::new_session;
-use crate::observer::Observer;
 use crate::omp::{
     ABORT_JOIN_BOUND, E_COST_CAP, E_LEAD_NEW_SESSION, GroupReport, NoteKind, OmpManager, Outcome,
     key_slug, lock,
@@ -390,11 +395,20 @@ pub enum Handled {
     Status(i64),
 }
 
+/// The current time in unix seconds.
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
+}
+
 /// What an owner row asks of the memory store.
 enum MemoryAct {
     Run(Command),
     /// The owner's yes (`true`) or no to the forget question about this id.
     Confirm(String, bool),
+    /// The recent-recalls command, in the owner's language.
+    Recalls(status::Lang),
 }
 
 /// How often a conversation saw an owner message, a delivered reply or posted news, and
@@ -463,11 +477,15 @@ pub struct Dispatcher {
     session_asked: Mutex<HashMap<String, Instant>>,
     /// Command rows that confirmed their conversation's open new-session question on arrival.
     session_confirmed: Mutex<std::collections::HashSet<i64>>,
-    /// The memory observer: its jev classifies plain-language memory requests the rules did
-    /// not match, and its state heads the memory listing. Without it only the rules run.
-    observer: Option<Arc<Observer>>,
+    /// Owner rows whose correction capture ran on arrival ([`lessons::capture`]) and that were
+    /// queued, with the note it gave: the worker reuses it instead of capturing the row again.
+    captured: Mutex<HashMap<i64, Option<String>>>,
     /// What the start check found about omp; a warning is sent to the owner once per version.
     omp_check: Option<OverlayCheck>,
+    /// `[memory.self]`: owner corrections are captured with it ([`lessons::capture`]).
+    self_config: SelfConfig,
+    /// `memory.recall.mode` and the mid-task mode, for the status answer.
+    recall_modes: (&'static str, &'static str),
 }
 
 impl Dispatcher {
@@ -500,21 +518,19 @@ impl Dispatcher {
             forget_asked: Mutex::default(),
             session_asked: Mutex::default(),
             session_confirmed: Mutex::default(),
-            observer: None,
+            captured: Mutex::default(),
             omp_check: None,
+            self_config: config.memory.self_file.clone(),
+            recall_modes: (
+                config.memory.recall_mode().as_str(),
+                config.memory.recall_mid_task().as_str(),
+            ),
         }
     }
 
     /// Turns on the owner memory commands, served by `memory`.
     pub fn with_memory(mut self, memory: MemoryHandle) -> Self {
         self.memory = Some(memory);
-        self
-    }
-
-    /// Lets `observer`'s jev classify memory requests the rules did not match, and shows its
-    /// state in the memory listing.
-    pub fn with_observer(mut self, observer: Arc<Observer>) -> Self {
-        self.observer = Some(observer);
         self
     }
 
@@ -595,7 +611,6 @@ impl Dispatcher {
             code: W_OMP_VERSION,
             job_id: None,
             omp_version: Some(check.version.clone()),
-            jev_model: None,
             detail: Some(check.version.clone()),
         })
     }
@@ -967,6 +982,12 @@ impl Dispatcher {
             }
             if event.attachments.is_empty() {
                 if let Some(handled) = self
+                    .refresh_command(id, key.as_str(), &event.text, true)
+                    .await?
+                {
+                    return Ok(handled);
+                }
+                if let Some(handled) = self
                     .memory_command(id, key.as_str(), &event.text, true)
                     .await?
                 {
@@ -1009,12 +1030,23 @@ impl Dispatcher {
                 }
             }
         }
-        // The same body the worker would send for this row.
-        let body = lead::owner_input(
+        // The same body the worker would send for this row, with the correction note. The
+        // capture runs once per row: it is kept for the worker (before the steer, so a worker
+        // that takes the row at once finds it) and dropped when the row is steered.
+        let mut body = lead::owner_input(
             key.as_str(),
             id,
             &files::prompt_with_files(&event.text, &saved),
         );
+        if sender == Sender::Owner
+            && let Some(memory) = &self.memory
+        {
+            let note = lessons::capture(memory, &self.self_config, id, &event.text);
+            if let Some(note) = &note {
+                body = format!("{body}\n\n{note}");
+            }
+            lock(&self.captured).insert(id, note);
+        }
         let mut claim_error = None;
         let steered = self.omp.try_steer(key.as_str(), id, sender, &body, |main| {
             self.store().steer_into(id, main).unwrap_or_else(|err| {
@@ -1023,6 +1055,7 @@ impl Dispatcher {
             })
         });
         if steered {
+            lock(&self.captured).remove(&id);
             return Ok(Handled::Steered(id));
         }
         tracing::info!(row = id, conversation = key.as_str(), "message queued");
@@ -1079,6 +1112,8 @@ impl Dispatcher {
             }
             row
         };
+        // Taken whatever happens to the row below, so no capture is left behind.
+        let captured = lock(&self.captured).remove(&row.id);
         let key = row.conversation_key.as_str();
         let from_owner = row.origin == "owner";
         if !from_owner && self.stale_news(&row)? {
@@ -1111,6 +1146,13 @@ impl Dispatcher {
 
         if from_owner && row.attachments.is_none() {
             if self.new_session_command(row.id, key, &row.text).await? {
+                return Ok(true);
+            }
+            if self
+                .refresh_command(row.id, key, &row.text, false)
+                .await?
+                .is_some()
+            {
                 return Ok(true);
             }
             if self
@@ -1147,8 +1189,19 @@ impl Dispatcher {
                     return Ok(true);
                 }
             };
-            let input =
+            let mut input =
                 lead::owner_input(key, row.id, &files::prompt_with_files(&row.text, &saved));
+            // A row queued after an arrival capture reuses it; one queued before a restart is
+            // captured now (the same source saves nothing twice).
+            let note = match captured {
+                Some(note) => note,
+                None => self.memory.as_ref().and_then(|memory| {
+                    lessons::capture(memory, &self.self_config, row.id, &row.text)
+                }),
+            };
+            if let Some(note) = note {
+                input = format!("{input}\n\n{note}");
+            }
             match self
                 .store()
                 .onboarding_turn(row.id)?
@@ -1183,9 +1236,7 @@ impl Dispatcher {
     /// `queued` and is claimed first (a row the worker took meanwhile is left to it), and any
     /// other message drops the forget question. The worker passes `arrival = false` for its
     /// already claimed row: it never answers a forget question, because the row may predate
-    /// it. A message the rules do not match is asked of jev ([`memory_commands::classify`])
-    /// on `arrival` only, so one row costs at most one jev call. Returns `None` when the row is
-    /// not for the memory store.
+    /// it. Returns `None` when the row is not for the memory store.
     async fn memory_command(
         &self,
         id: i64,
@@ -1205,12 +1256,8 @@ impl Dispatcher {
             .and_then(|target| {
                 memory_commands::confirmation(text).map(|yes| MemoryAct::Confirm(target, yes))
             })
-            .or_else(|| memory_commands::parse(text).map(MemoryAct::Run));
-        let act = match act {
-            Some(act) => Some(act),
-            None if arrival => self.classify(text).await.map(MemoryAct::Run),
-            None => None,
-        };
+            .or_else(|| memory_commands::parse(text).map(MemoryAct::Run))
+            .or_else(|| memory_commands::recent_recalls_request(text).map(MemoryAct::Recalls));
         let Some(act) = act else {
             if arrival {
                 lock(&self.forget_asked).remove(key);
@@ -1226,13 +1273,14 @@ impl Dispatcher {
         }
         let reply = match act {
             MemoryAct::Confirm(target, yes) => memory_commands::forget(memory, &target, yes).await,
+            MemoryAct::Recalls(lang) => {
+                let rows = self
+                    .store()
+                    .recent_recalls(memory_commands::RECENT_RECALLS)?;
+                memory_commands::recent_recalls(memory, lang, &rows, unix_now())
+            }
             MemoryAct::Run(command) => {
-                let status = self
-                    .observer
-                    .as_ref()
-                    .map(|observer| observer.status_line())
-                    .unwrap_or_default();
-                let answer = memory_commands::run(memory, key, id, &status, command).await;
+                let answer = memory_commands::run(memory, key, id, command).await;
                 if let Some(target) = answer.confirm_forget {
                     lock(&self.forget_asked).insert(key.to_owned(), target);
                 }
@@ -1321,6 +1369,37 @@ impl Dispatcher {
         Ok(Some(Handled::Status(id)))
     }
 
+    /// Answers owner row `id` of conversation `key` when its whole `text` is the refresh command
+    /// ([`memory_commands::refresh_request`]): the lead's system prompt is set again before its
+    /// next turn ([`OmpManager::refresh_memory`]), and the short answer is stored and sent like a
+    /// status answer. On `arrival` the row is claimed first, like [`Self::status_command`], and
+    /// an open forget question of the conversation is dropped. Returns `None` when the row is not
+    /// the command.
+    async fn refresh_command(
+        &self,
+        id: i64,
+        key: &str,
+        text: &str,
+        arrival: bool,
+    ) -> Result<Option<Handled>, StoreError> {
+        let Some(lang) = memory_commands::refresh_request(text) else {
+            return Ok(None);
+        };
+        if arrival {
+            lock(&self.forget_asked).remove(key);
+            let _gate = self.admission.lock().await;
+            if !self.store().claim(id)? {
+                return Ok(None);
+            }
+        }
+        self.omp.refresh_memory();
+        tracing::info!(row = id, conversation = key, "memory refresh requested");
+        self.store()
+            .finish_direct(id, memory_commands::refresh_text(lang))?;
+        self.send_reply(id).await?;
+        Ok(Some(Handled::Memory(id)))
+    }
+
     /// The status answer for conversation `key`: the lead's turn and the running lanes.
     fn status_reply(&self, lang: status::Lang, key: &str) -> Result<String, StoreError> {
         let now = Instant::now();
@@ -1349,10 +1428,24 @@ impl Dispatcher {
             lang,
             key,
             lead.as_ref(),
+            &self.omp.lead_cache(),
+            Some(&self.recall_status()?),
             &lanes,
             others.len(),
             &|text| self.omp.clean_note(text),
         ))
+    }
+
+    /// The recall advisor's modes and recent use, for the status answer.
+    fn recall_status(&self) -> Result<status::RecallStatus, StoreError> {
+        let now = unix_now();
+        let store = self.store();
+        Ok(status::RecallStatus {
+            mode: self.recall_modes.0,
+            mid: self.recall_modes.1,
+            calls_last_hour: store.recall_calls_since(now - 3600)?,
+            last_delivered: store.last_delivered_recall()?.map(|at| now - at),
+        })
     }
 
     /// Drops lane news row `row` when its lane no longer runs: the note is out of date and the
@@ -1380,16 +1473,6 @@ impl Dispatcher {
         self.store()
             .mark(row.id, State::Failed, Some(E_LANE_NEWS_STALE))?;
         Ok(true)
-    }
-
-    /// jev's reading of an owner message the rules did not match, when an observer is attached
-    /// and the message holds memory words or an entry id.
-    async fn classify(&self, text: &str) -> Option<Command> {
-        let observer = self.observer.as_ref()?;
-        if !memory_commands::looks_like_memory_request(text) {
-            return None;
-        }
-        memory_commands::classify(observer.jev(), observer.redactor(), text).await
     }
 
     /// Stores the outcome of a lead turn and its steered row, if any: one reply on the

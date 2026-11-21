@@ -135,9 +135,10 @@ fn the_set_covers_what_the_plan_asks_for() {
     for prov in ["lane", "subagent", "tool"] {
         assert!(entries().any(|e| e.prov == prov), "{prov} entries");
     }
-    for bucket in ["self_obs", "self"] {
-        assert!(entries().any(|e| e.bucket == bucket), "{bucket} entries");
-    }
+    assert!(
+        entries().any(|e| e.bucket == "self_obs"),
+        "self_obs entries"
+    );
     // PR 3b: wakes on the lead's tool events while it works.
     assert!(count(&|_, t| t.mid()) >= 5, "mid turns");
     assert!(

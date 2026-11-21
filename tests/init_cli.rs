@@ -251,7 +251,7 @@ fn check_config_fails_on_loose_token_mode() {
     assert!(String::from_utf8_lossy(&check.stdout).contains("E_TOKEN_MODE"));
 }
 
-/// moraedang on #46: `check-config` never prints a jev key written into `config.toml`.
+/// moraedang on #46: `check-config` never prints a key written into `config.toml`.
 #[test]
 fn check_config_never_prints_a_key_written_into_the_config() {
     let tmp = short_tempdir();
@@ -261,7 +261,7 @@ fn check_config_never_prints_a_key_written_into_the_config() {
     assert!(run_init(&home, &input).status.success());
     let config = home.join("config.toml");
     let mut text = fs::read_to_string(&config).expect("config.toml");
-    text.push_str("\n[memory.jev]\napi_key = \"JEV_KEY_SENTINEL_5a0c\"\n");
+    text.push_str("\n[memory]\napi_key = \"JEV_KEY_SENTINEL_5a0c\"\n");
     fs::write(&config, text).expect("write config");
 
     let check = moraebot(&home)
